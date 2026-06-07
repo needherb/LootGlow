@@ -1,0 +1,70 @@
+# LootGlow / OBSE64 plugin build artifacts
+
+# xmake
+.xmake/
+build/
+.xmake.lua
+
+# Visual Studio / MSVC
+.vs/
+*.sln.docstates
+*.user
+*.userosscache
+*.suo
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.tlog
+*.lastbuildstate
+*.recipe
+*.ilk
+*.idb
+*.pdb
+
+# Compiled binaries and libraries
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+
+# Logs
+*.log
+LootGlow.log
+
+# Archives / release packages
+*.zip
+*.7z
+*.rar
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.old
+*~
+.DS_Store
+Thumbs.db
+
+# Editor folders
+.vscode/
+.idea/
+
+# Local environment/config files
+.env
+.env.*
+local/
+_local/
+
+# Keep source and documentation tracked:
+# - src/main.cpp
+# - xmake.lua
+# - README.md
+# - LICENSE
+# - LootGlow.ini
+# - docs/THIRD_PARTY_NOTICES.md
