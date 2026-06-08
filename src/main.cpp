@@ -23,7 +23,7 @@
 namespace
 {
 	// ============================================================================
-	// LootGlow v0.1.0 release cleanup
+	// LootGlow v0.1.1 V69B stability summary
 	//
 	// Proven path:
 	//   - Hook TESObjectREFR::LoadGraphics vfunc[0x59].
@@ -61,7 +61,11 @@ namespace
 	constexpr RE::TESFormID kDefaultGoldFormID = 0x0000000F;
 	constexpr std::uint32_t kDefaultGlowStackCount = 8;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
-	constexpr std::uint32_t kMaxTrackedRefs = 1024;
+	constexpr std::uint32_t kMaxTrackedRefs = 8192;
+	constexpr std::uint32_t kMaxDelayedRescans = 256;
+	constexpr std::uint64_t kDelayedRescanDelayMs = 500;
+	constexpr std::uint64_t kStatsLogIntervalMs = 30000;
+	constexpr std::uint64_t kStatsMilestoneInterval = 25;
 
 	struct Settings
 	{
@@ -91,6 +95,11 @@ namespace
 		bool lastHasGold{ false };
 		std::int32_t lastGoldTotalCount{ -1 };
 		std::uint32_t activeStacks{ 0 };
+		std::uint64_t firstSeenMs{ 0 };
+		std::uint64_t lastSeenMs{ 0 };
+		std::uint64_t lastScanMs{ 0 };
+		std::uint64_t lastApplyMs{ 0 };
+		std::uint64_t lastRemoveMs{ 0 };
 		std::array<void*, kMaxGlowStackCount> effects{};
 		char name[96]{};
 	};
@@ -108,11 +117,35 @@ namespace
 		std::uint64_t skippedAlreadyApplied{ 0 };
 		std::uint64_t skippedAlreadyRemoved{ 0 };
 		std::uint64_t shaderResolveFailures{ 0 };
+		std::uint64_t trackingTableFull{ 0 };
+		std::uint64_t pointerReuseResets{ 0 };
+		std::uint64_t repairAttempts{ 0 };
+		std::uint64_t repairSuccesses{ 0 };
+		std::uint64_t delayedRescansQueued{ 0 };
+		std::uint64_t delayedRescansProcessed{ 0 };
+		std::uint64_t delayedRescanQueueFull{ 0 };
+		std::uint64_t delayedRescanExceptions{ 0 };
+		std::uint64_t scanCalls{ 0 };
+		std::uint64_t scanGoldPresent{ 0 };
+		std::uint64_t scanGoldAbsent{ 0 };
+	};
+
+	struct DelayedRescan
+	{
+		std::uintptr_t ref{ 0 };
+		std::uint64_t dueMs{ 0 };
+		char reason[48]{};
 	};
 
 	static std::array<TrackedRef, kMaxTrackedRefs> g_trackedRefs{};
+	static std::array<DelayedRescan, kMaxDelayedRescans> g_delayedRescans{};
 	static Counters g_counters{};
 	static RE::TESEffectShader* g_shader{ nullptr };
+	static std::uint64_t g_lastStatsLogMs{ 0 };
+	static std::uint64_t g_lastStatsUniqueContainers{ 0 };
+	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
+	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
+	static std::uint64_t g_lastStatsDelayedProcessed{ 0 };
 
 	std::uint32_t ClampStackCount(std::uint32_t a_value)
 	{
@@ -261,13 +294,26 @@ namespace
 		       (a_value % alignof(void*) == 0);
 	}
 
-	void CopyName(char (&a_dst)[96], std::string_view a_name)
+	std::uint64_t NowMs()
 	{
+		return static_cast<std::uint64_t>(::GetTickCount64());
+	}
+
+	void ClearTrackedRef(TrackedRef& a_entry)
+	{
+		a_entry = TrackedRef{};
+	}
+
+	template <std::size_t N>
+	void CopyName(char (&a_dst)[N], std::string_view a_name)
+	{
+		static_assert(N > 0);
 		for (auto& ch : a_dst) {
 			ch = 0;
 		}
 
-		const auto count = a_name.size() < 95 ? a_name.size() : 95;
+		const auto maxChars = N - 1;
+		const auto count = a_name.size() < maxChars ? a_name.size() : maxChars;
 		for (std::size_t i = 0; i < count; ++i) {
 			a_dst[i] = a_name[i];
 		}
@@ -430,6 +476,108 @@ namespace
 		return count;
 	}
 
+	std::uint32_t CountTrackedRefs()
+	{
+		std::uint32_t count = 0;
+		for (const auto& entry : g_trackedRefs) {
+			if (entry.ref != 0) {
+				++count;
+			}
+		}
+		return count;
+	}
+
+	bool MilestoneReached(std::uint64_t a_current, std::uint64_t& a_lastReported)
+	{
+		if (a_current >= a_lastReported + kStatsMilestoneInterval) {
+			a_lastReported = a_current;
+			return true;
+		}
+		return false;
+	}
+
+	void MaybeLogTrackingStats(const char* a_reason, bool a_force = false)
+	{
+		const auto now = NowMs();
+		const bool milestone =
+			MilestoneReached(g_counters.uniqueContainers, g_lastStatsUniqueContainers) ||
+			MilestoneReached(g_counters.applySuccesses, g_lastStatsApplySuccesses) ||
+			MilestoneReached(g_counters.removeSuccesses, g_lastStatsRemoveSuccesses) ||
+			MilestoneReached(g_counters.delayedRescansProcessed, g_lastStatsDelayedProcessed);
+
+		const bool warningState =
+			g_counters.trackingTableFull != 0 ||
+			g_counters.delayedRescanQueueFull != 0 ||
+			g_counters.delayedRescanExceptions != 0 ||
+			g_counters.pointerReuseResets != 0;
+
+		if (!a_force && !g_settings.debugLogging && !warningState) {
+			return;
+		}
+		if (!a_force && !milestone && g_lastStatsLogMs != 0 && now - g_lastStatsLogMs < kStatsLogIntervalMs) {
+			return;
+		}
+
+		g_lastStatsLogMs = now;
+		REX::INFO("[LootGlow] stability summary reason={}, tracked={}/{}, glowing={}, loadGraphicsHits={}, containerLoadHits={}, scans={} present={} absent={}, applies={}/{}, removes={}, skippedApplied={}, skippedRemoved={}, tableFull={}, queueFull={}, reuseResets={}, repairs={}/{}, delayedQueued={}, delayedProcessed={}, delayedExceptions={}",
+			a_reason ? a_reason : "periodic",
+			CountTrackedRefs(),
+			kMaxTrackedRefs,
+			CountActiveGlowingRefs(),
+			g_counters.loadGraphicsHits,
+			g_counters.containerLoadHits,
+			g_counters.scanCalls,
+			g_counters.scanGoldPresent,
+			g_counters.scanGoldAbsent,
+			g_counters.applySuccesses,
+			g_counters.applyAttempts,
+			g_counters.removeSuccesses,
+			g_counters.skippedAlreadyApplied,
+			g_counters.skippedAlreadyRemoved,
+			g_counters.trackingTableFull,
+			g_counters.delayedRescanQueueFull,
+			g_counters.pointerReuseResets,
+			g_counters.repairSuccesses,
+			g_counters.repairAttempts,
+			g_counters.delayedRescansQueued,
+			g_counters.delayedRescansProcessed,
+			g_counters.delayedRescanExceptions);
+	}
+
+	void QueueDelayedRescan(RE::TESObjectREFR* a_ref, const char* a_reason)
+	{
+		const auto ref = reinterpret_cast<std::uintptr_t>(a_ref);
+		if (!LooksPointerish(ref)) {
+			return;
+		}
+
+		const auto due = NowMs() + kDelayedRescanDelayMs;
+		DelayedRescan* slot = nullptr;
+		for (auto& entry : g_delayedRescans) {
+			if (entry.ref == ref) {
+				slot = &entry;
+				break;
+			}
+			if (!slot && entry.ref == 0) {
+				slot = &entry;
+			}
+		}
+
+		if (!slot) {
+			++g_counters.delayedRescanQueueFull;
+			MaybeLogTrackingStats("delayed-queue-full", true);
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] delayed rescan queue full; ref={:016X}, reason={}", ref, a_reason ? a_reason : "<none>");
+			}
+			return;
+		}
+
+		slot->ref = ref;
+		slot->dueMs = due;
+		CopyName(slot->reason, a_reason ? std::string_view(a_reason) : std::string_view("delayed"));
+		++g_counters.delayedRescansQueued;
+	}
+
 	TrackedRef* TrackContainer(RE::TESObjectREFR* a_ref, RE::TESObjectCONT* a_container, std::string_view a_name, std::uintptr_t a_loadGraphicsNode)
 	{
 		const auto ref = reinterpret_cast<std::uintptr_t>(a_ref);
@@ -437,19 +585,40 @@ namespace
 			return nullptr;
 		}
 
+		const auto now = NowMs();
+		const auto currentRefFormID = a_ref ? a_ref->GetFormID() : 0;
+		const auto currentBaseFormID = a_container ? a_container->GetFormID() : 0;
+
 		if (auto* existing = FindTrackedRef(ref)) {
-			++existing->loadHits;
-			if (LooksPointerish(a_loadGraphicsNode)) {
-				existing->loadGraphicsNode = a_loadGraphicsNode;
+			const bool refFormChanged = existing->refFormID != 0 && currentRefFormID != 0 && existing->refFormID != currentRefFormID;
+			const bool baseFormChanged = existing->baseFormID != 0 && currentBaseFormID != 0 && existing->baseFormID != currentBaseFormID;
+			if (refFormChanged || baseFormChanged) {
+				++g_counters.pointerReuseResets;
+				MaybeLogTrackingStats("pointer-reuse-reset", true);
+				if (g_settings.debugLogging) {
+					REX::INFO("[LootGlow] tracked ref pointer appears reused; resetting slot ptr={:016X}, oldRefForm={:08X}, newRefForm={:08X}, oldBaseForm={:08X}, newBaseForm={:08X}",
+						ref,
+						existing->refFormID,
+						currentRefFormID,
+						existing->baseFormID,
+						currentBaseFormID);
+				}
+				ClearTrackedRef(*existing);
+			} else {
+				++existing->loadHits;
+				existing->lastSeenMs = now;
+				if (LooksPointerish(a_loadGraphicsNode)) {
+					existing->loadGraphicsNode = a_loadGraphicsNode;
+				}
+				return existing;
 			}
-			return existing;
 		}
 
 		for (auto& entry : g_trackedRefs) {
 			if (entry.ref == 0) {
 				entry.ref = ref;
-				entry.refFormID = a_ref ? a_ref->GetFormID() : 0;
-				entry.baseFormID = a_container ? a_container->GetFormID() : 0;
+				entry.refFormID = currentRefFormID;
+				entry.baseFormID = currentBaseFormID;
 				entry.loadHits = 1;
 				entry.loadGraphicsNode = a_loadGraphicsNode;
 				entry.applied = false;
@@ -457,16 +626,27 @@ namespace
 				entry.lastHasGold = false;
 				entry.lastGoldTotalCount = -1;
 				entry.activeStacks = 0;
+				entry.firstSeenMs = now;
+				entry.lastSeenMs = now;
+				entry.lastScanMs = 0;
+				entry.lastApplyMs = 0;
+				entry.lastRemoveMs = 0;
 				entry.effects.fill(nullptr);
 				CopyName(entry.name, a_name);
 				++g_counters.uniqueContainers;
 
-
+				MaybeLogTrackingStats("track-new");
 				return &entry;
 			}
 		}
 
-		REX::INFO("[LootGlow] tracking table full at capacity {}; container ref={:016X} was not tracked", kMaxTrackedRefs, ref);
+		++g_counters.trackingTableFull;
+		REX::INFO("[LootGlow] tracking table full at capacity {}; container ref={:016X}, refForm={:08X}, baseForm={:08X} was not tracked",
+			kMaxTrackedRefs,
+			ref,
+			currentRefFormID,
+			currentBaseFormID);
+		MaybeLogTrackingStats("table-full");
 		return nullptr;
 	}
 
@@ -503,8 +683,10 @@ namespace
 		const auto oldStacks = a_entry->activeStacks;
 		a_entry->applied = false;
 		a_entry->activeStacks = 0;
+		a_entry->lastRemoveMs = NowMs();
 		a_entry->effects.fill(nullptr);
 		++g_counters.removeSuccesses;
+		MaybeLogTrackingStats("remove-success");
 
 		if (g_settings.debugLogging) {
 			REX::INFO("LootGlow removed/finished winner shader formID={:08X}: ref={:016X}, refForm={:08X}, baseForm={:08X}, previousStacks={}, activeGlowingRefs={}, reason={}, name={}",
@@ -527,9 +709,23 @@ namespace
 			return false;
 		}
 
+		bool didRepair = false;
+
 		if (a_entry->applied) {
-			++g_counters.skippedAlreadyApplied;
-			return true;
+			if (a_entry->activeStacks >= g_settings.glowStackCount) {
+				++g_counters.skippedAlreadyApplied;
+				return true;
+			}
+
+			didRepair = true;
+			++g_counters.repairAttempts;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] repairing incomplete/stale glow state: ref={:016X}, activeStacks={}, expectedStacks={}",
+					a_entry->ref,
+					a_entry->activeStacks,
+					g_settings.glowStackCount);
+			}
+			RemoveGlowFromContainer(a_ref, a_entry, "repair stale/incomplete applied state");
 		}
 
 		auto* shader = ResolveWinnerShader();
@@ -596,7 +792,12 @@ namespace
 
 		a_entry->applied = true;
 		a_entry->activeStacks = stackSuccesses;
+		a_entry->lastApplyMs = NowMs();
+		if (didRepair) {
+			++g_counters.repairSuccesses;
+		}
 		++g_counters.applySuccesses;
+		MaybeLogTrackingStats(didRepair ? "repair-apply-success" : "apply-success");
 
 		if (g_settings.debugLogging) {
 			REX::INFO("LootGlow applied winner shader formID={:08X}: ref={:016X}, refForm={:08X}, baseForm={:08X}, loadNode={:016X}, stacks={}/{}, activeGlowingRefs={}, name={}",
@@ -732,6 +933,7 @@ namespace LootGlow::GoldSelection
 		}
 
 		const char* source = (a_source && a_source[0]) ? a_source : "unknown";
+		++g_counters.scanCalls;
 
 		auto* container = GetContainer(a_ref);
 		if (!container) {
@@ -779,6 +981,12 @@ namespace LootGlow::GoldSelection
 			}
 		}
 
+		if (hasGold) {
+			++g_counters.scanGoldPresent;
+		} else {
+			++g_counters.scanGoldAbsent;
+		}
+
 		auto* entry = EnsureTrackedHoverContainer(a_ref);
 		if (!entry) {
 			if (hasGold && g_settings.debugLogging) {
@@ -789,6 +997,8 @@ namespace LootGlow::GoldSelection
 			}
 			return false;
 		}
+
+		entry->lastScanMs = NowMs();
 
 		const bool stateChanged = !entry->hoverSeen || entry->lastHasGold != hasGold || entry->lastGoldTotalCount != goldTotalCount;
 		if (stateChanged && g_settings.debugLogging) {
@@ -823,7 +1033,7 @@ namespace LootGlow::GoldSelection
 			return false;
 		}
 
-		if (entry->applied) {
+		if (entry->applied && entry->activeStacks >= g_settings.glowStackCount) {
 			return true;
 		}
 
@@ -838,6 +1048,39 @@ namespace LootGlow::GoldSelection
 		return ::ApplyGlowToContainer(a_ref, entry);
 	}
 
+	void ProcessDelayedRescans()
+	{
+		const auto now = NowMs();
+		for (auto& pending : g_delayedRescans) {
+			if (pending.ref == 0 || pending.dueMs > now) {
+				continue;
+			}
+
+			const auto ref = pending.ref;
+			char reason[48]{};
+			CopyName(reason, pending.reason[0] ? std::string_view(pending.reason) : std::string_view("delayed-rescan"));
+			pending = DelayedRescan{};
+			++g_counters.delayedRescansProcessed;
+			MaybeLogTrackingStats("delayed-processed");
+
+			if (!LooksPointerish(ref)) {
+				continue;
+			}
+
+			auto* refr = reinterpret_cast<RE::TESObjectREFR*>(ref);
+#if defined(_MSC_VER)
+			__try {
+#endif
+				InspectAndApplyGoldGlow(refr, reason);
+#if defined(_MSC_VER)
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				++g_counters.delayedRescanExceptions;
+				MaybeLogTrackingStats("delayed-exception", true);
+				REX::INFO("[LootGlow] delayed rescan skipped after exception; stale ref={:016X}, reason={}", ref, reason);
+			}
+#endif
+		}
+	}
 
 }
 
@@ -845,8 +1088,11 @@ struct Hook_SetInfoForRef_GoldSelection
 {
 	static bool SetInfoForRef(RE::TESObjectREFR* a_ref, bool a_arg2, bool a_arg3)
 	{
+		LootGlow::GoldSelection::ProcessDelayedRescans();
 		const bool result = SetInfoForRefHook(a_ref, a_arg2, a_arg3);
 		LootGlow::GoldSelection::InspectAndApplyGoldGlow(a_ref, "hover-update");
+		QueueDelayedRescan(a_ref, "delayed-hover-update");
+		LootGlow::GoldSelection::ProcessDelayedRescans();
 		return result;
 	}
 
@@ -865,6 +1111,7 @@ struct Hook_LoadGraphics_GoldSelection
 	{
 		auto result = LoadGraphicsFuncHook(a_ref);
 		++g_counters.loadGraphicsHits;
+		LootGlow::GoldSelection::ProcessDelayedRescans();
 
 		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
 		if (!baseObject) {
@@ -888,7 +1135,10 @@ struct Hook_LoadGraphics_GoldSelection
 		// runtime inventory changes after load.
 		if (TrackContainer(a_ref, container, name, result)) {
 			LootGlow::GoldSelection::InspectAndApplyGoldGlow(a_ref, "auto-scan");
+			QueueDelayedRescan(a_ref, "delayed-auto-scan");
 		}
+
+		MaybeLogTrackingStats("loadgraphics");
 
 		return result;
 	}
@@ -920,13 +1170,14 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	LoadSettings();
 
 	REX::INFO("========================");
-	REX::INFO("LootGlow v0.1.0 initialized");
+	REX::INFO("LootGlow v0.1.1 V69B stability summary initialized");
 	REX::INFO("Configured shader={:08X}, goldFormID={:08X}, stacks={}, debugLogging={}",
 		g_settings.winnerShaderFormID,
 		g_settings.goldFormID,
 		g_settings.glowStackCount,
 		g_settings.debugLogging);
-	REX::INFO("Gold-containing loaded containers will glow automatically; hover/open updates remove glow after gold is looted.");
+	REX::INFO("Gold-containing loaded containers will glow automatically; hover/open updates plus delayed rescans repair/remove glow after inventory changes.");
+	MaybeLogTrackingStats("startup", true);
 	REX::INFO("========================");
 	return true;
 }
