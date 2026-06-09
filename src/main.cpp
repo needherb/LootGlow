@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 
 #include <Windows.h>
 
@@ -17,49 +19,110 @@
 // the runtime addresses and layout recovered from powerof3's Oblivion
 // Remastered Unread Books Glow DLL.
 #include "RE/T/TESFullName.h"
+#if __has_include("RE/T/TESObjectMISC.h")
+#	include "RE/T/TESObjectMISC.h"
+#	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectWEAP.h")
+#	include "RE/T/TESObjectWEAP.h"
+#	define LOOTGLOW_HAS_TESOBJECTWEAP_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTWEAP_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectARMO.h")
+#	include "RE/T/TESObjectARMO.h"
+#	define LOOTGLOW_HAS_TESOBJECTARMO_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTARMO_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectBOOK.h")
+#	include "RE/T/TESObjectBOOK.h"
+#	define LOOTGLOW_HAS_TESOBJECTBOOK_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTBOOK_HEADER 0
+#endif
+#if __has_include("RE/A/AlchemyItem.h")
+#	include "RE/A/AlchemyItem.h"
+#	define LOOTGLOW_HAS_ALCHEMYITEM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_ALCHEMYITEM_HEADER 0
+#endif
+#if __has_include("RE/I/IngredientItem.h")
+#	include "RE/I/IngredientItem.h"
+#	define LOOTGLOW_HAS_INGREDIENTITEM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_INGREDIENTITEM_HEADER 0
+#endif
+#if __has_include("RE/T/TESAmmo.h")
+#	include "RE/T/TESAmmo.h"
+#	define LOOTGLOW_HAS_TESAMMO_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESAMMO_HEADER 0
+#endif
+#if __has_include("RE/T/TESSoulGem.h")
+#	include "RE/T/TESSoulGem.h"
+#	define LOOTGLOW_HAS_TESSOULGEM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESSOULGEM_HEADER 0
+#endif
+#if __has_include("RE/T/TESKey.h")
+#	include "RE/T/TESKey.h"
+#	define LOOTGLOW_HAS_TESKEY_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESKEY_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectLIGH.h")
+#	include "RE/T/TESObjectLIGH.h"
+#	define LOOTGLOW_HAS_TESOBJECTLIGH_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTLIGH_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectCLOT.h")
+#	include "RE/T/TESObjectCLOT.h"
+#	define LOOTGLOW_HAS_TESOBJECTCLOT_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTCLOT_HEADER 0
+#endif
+#if __has_include("RE/T/TESObjectAPPA.h")
+#	include "RE/T/TESObjectAPPA.h"
+#	define LOOTGLOW_HAS_TESOBJECTAPPA_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESOBJECTAPPA_HEADER 0
+#endif
+#if __has_include("RE/T/TESEnchantableForm.h")
+#	include "RE/T/TESEnchantableForm.h"
+#	define LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER 0
+#endif
+#if __has_include("RE/E/EnchantmentItem.h")
+#	include "RE/E/EnchantmentItem.h"
+#	define LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER 0
+#endif
+#if __has_include("RE/M/MagicItem.h")
+#	include "RE/M/MagicItem.h"
+#	define LOOTGLOW_HAS_MAGICITEM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_MAGICITEM_HEADER 0
+#endif
 #include "RE/T/TESObjectCONT.h"
 #include "RE/T/TESObjectREFR.h"
 
 namespace
 {
-	// ============================================================================
-	// LootGlow v0.1.1 V69B stability summary
-	//
-	// Proven path:
-	//   - Hook TESObjectREFR::LoadGraphics vfunc[0x59].
-	//   - Detect containers only.
-	//   - Construct MagicShaderHitEffect with the runtime constructor.
-	//   - Call effect vfunc +0x38 Init/start.
-	//   - Insert effect +0x18 into ProcessLists::magicEffectList at +0x90/+0x98.
-	//
-	// Release behavior:
-	//   - Loaded containers are scanned for the configured gold form.
-	//   - Gold-containing containers receive a stacked shader glow.
-	//   - The hover/menu path re-checks inventory changes and removes the glow once
-	//     gold has been looted.
-	//
-	// Removed from this cleaned build:
-	//   - Runtime TESEffectShader scanner.
-	//   - Shader visual sweep slot assignment.
-	//   - MagicShaderHitEffect resolver observer hook.
-	//   - effect +0x30 and effect +0x80 mutation/instrumentation.
-	//   - Detect Life actor-path experiments and hotkeys.
-	// ============================================================================
-
-	// Release settings. Defaults keep the runtime log quiet for container-dense
-	// areas. Optional INI
-	// override paths are searched from the executable directory and parent game
-	// directories.
-	//
-	// Example:
-	//   [LootGlow]
-	//   GoldFormID=0000000F
-	//   ShaderFormID=000C793F
-	//   StackCount=8
-	//   DebugLogging=0
+	// Runtime addresses/layouts mirror the proven MagicShaderHitEffect path used by
+	// the current stable LootGlow release.
 	constexpr RE::TESFormID kDefaultWinnerShaderFormID = 0x000C793F;
 	constexpr RE::TESFormID kDefaultGoldFormID = 0x0000000F;
 	constexpr std::uint32_t kDefaultGlowStackCount = 8;
+	constexpr std::uint32_t kDefaultGoldCountThreshold = 100;
+	constexpr RE::TESFormID kDefaultHighValueShaderFormID = 0x000C793E;
+	constexpr std::uint32_t kDefaultHighValueGlowStackCount = 6;
+	constexpr std::uint32_t kDefaultHighValueThreshold = 250;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
 	constexpr std::uint32_t kMaxTrackedRefs = 8192;
 	constexpr std::uint32_t kMaxDelayedRescans = 256;
@@ -71,17 +134,53 @@ namespace
 	{
 		RE::TESFormID winnerShaderFormID{ kDefaultWinnerShaderFormID };
 		RE::TESFormID goldFormID{ kDefaultGoldFormID };
+		std::uint32_t goldCountThreshold{ kDefaultGoldCountThreshold };
+		std::uint32_t goldLogging{ 0 };
 		std::uint32_t glowStackCount{ kDefaultGlowStackCount };
 		bool debugLogging{ false };
+
+		bool highValueMode{ true };
+		std::uint32_t highValueLogging{ 0 };
+		bool highValueIncludeGold{ false };
+		std::uint32_t highValueThreshold{ kDefaultHighValueThreshold };
+		RE::TESFormID highValueShaderFormID{ kDefaultHighValueShaderFormID };
+		std::uint32_t highValueGlowStackCount{ kDefaultHighValueGlowStackCount };
 	};
 
 	static Settings g_settings{};
+
+	bool GoldEventLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.goldLogging >= 1;
+	}
+
+	bool GoldSummaryLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.goldLogging >= 2;
+	}
+
+	bool HighValueEventLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.highValueLogging >= 1;
+	}
+
+	bool HighValueSummaryLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.highValueLogging >= 2;
+	}
 
 	constexpr std::uintptr_t kMagicShaderHitEffectSize = 0xA0;
 	constexpr std::uintptr_t kMagicShaderHitEffectBSTempEffectOffset = 0x18;
 	constexpr std::uintptr_t kProcessListsMagicEffectHeadItemOffset = 0x90;
 	constexpr std::uintptr_t kProcessListsMagicEffectHeadNextOffset = 0x98;
 	constexpr std::uintptr_t kBSTempEffectRefCountOffset = 0x08;
+
+	struct GlowStackState
+	{
+		bool applied{ false };
+		std::uint32_t activeStacks{ 0 };
+		std::array<void*, kMaxGlowStackCount> effects{};
+	};
 
 	struct TrackedRef
 	{
@@ -90,17 +189,19 @@ namespace
 		std::uint32_t baseFormID{ 0 };
 		std::uint32_t loadHits{ 0 };
 		std::uintptr_t loadGraphicsNode{ 0 };
-		bool applied{ false };
+		GlowStackState gold{};
+		GlowStackState highValue{};
 		bool hoverSeen{ false };
 		bool lastHasGold{ false };
+		bool lastHasHighValue{ false };
 		std::int32_t lastGoldTotalCount{ -1 };
-		std::uint32_t activeStacks{ 0 };
+		std::uint64_t lastKnownFullValueTotal{ 0 };
+		std::uint32_t lastHighestFullValueEach{ 0 };
 		std::uint64_t firstSeenMs{ 0 };
 		std::uint64_t lastSeenMs{ 0 };
 		std::uint64_t lastScanMs{ 0 };
 		std::uint64_t lastApplyMs{ 0 };
 		std::uint64_t lastRemoveMs{ 0 };
-		std::array<void*, kMaxGlowStackCount> effects{};
 		char name[96]{};
 	};
 
@@ -141,6 +242,7 @@ namespace
 	static std::array<DelayedRescan, kMaxDelayedRescans> g_delayedRescans{};
 	static Counters g_counters{};
 	static RE::TESEffectShader* g_shader{ nullptr };
+	static RE::TESEffectShader* g_highValueShader{ nullptr };
 	static std::uint64_t g_lastStatsLogMs{ 0 };
 	static std::uint64_t g_lastStatsUniqueContainers{ 0 };
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
@@ -183,8 +285,19 @@ namespace
 
 		g_settings.winnerShaderFormID = ReadHexFormIDSetting(a_path, "ShaderFormID", kDefaultWinnerShaderFormID);
 		g_settings.goldFormID = ReadHexFormIDSetting(a_path, "GoldFormID", kDefaultGoldFormID);
+		g_settings.goldCountThreshold = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "GoldCountThreshold", kDefaultGoldCountThreshold, a_path));
+		if (g_settings.goldCountThreshold == 0) {
+			g_settings.goldCountThreshold = 1;
+		}
+		g_settings.goldLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "GoldLogging", 0, a_path));
 		g_settings.glowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "StackCount", kDefaultGlowStackCount, a_path)));
 		g_settings.debugLogging = GetPrivateProfileIntA("LootGlow", "DebugLogging", 0, a_path) != 0;
+		g_settings.highValueMode = GetPrivateProfileIntA("LootGlow", "HighValueMode", 1, a_path) != 0;
+		g_settings.highValueLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueLogging", 0, a_path));
+		g_settings.highValueIncludeGold = GetPrivateProfileIntA("LootGlow", "HighValueIncludeGold", 0, a_path) != 0;
+		g_settings.highValueThreshold = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueThreshold", kDefaultHighValueThreshold, a_path));
+		g_settings.highValueShaderFormID = ReadHexFormIDSetting(a_path, "HighValueShaderFormID", kDefaultHighValueShaderFormID);
+		g_settings.highValueGlowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueStackCount", kDefaultHighValueGlowStackCount, a_path)));
 
 		REX::INFO("LootGlow settings loaded from {}", a_path);
 		return true;
@@ -340,6 +453,27 @@ namespace
 		return g_shader;
 	}
 
+	RE::TESEffectShader* ResolveHighValueShader()
+	{
+		if (g_highValueShader) {
+			return g_highValueShader;
+		}
+
+		g_highValueShader = RE::TESForm::LookupByID<RE::TESEffectShader>(g_settings.highValueShaderFormID);
+		if (g_highValueShader) {
+			if (g_settings.debugLogging) {
+				REX::INFO("LootGlow high-value shader resolved: ptr={:016X}, formID={:08X}",
+					reinterpret_cast<std::uintptr_t>(g_highValueShader),
+					g_settings.highValueShaderFormID);
+			}
+		} else {
+			++g_counters.shaderResolveFailures;
+			REX::INFO("LootGlow high-value shader lookup failed/not ready: formID={:08X}", g_settings.highValueShaderFormID);
+		}
+
+		return g_highValueShader;
+	}
+
 	void* AllocateGameObject(std::uint64_t a_size)
 	{
 		REL::Relocation<AllocFn> fn{ REL::Offset{ 0x04702CB0 } };  // FUN_144702CB0 / allocator used by po3 path
@@ -469,7 +603,7 @@ namespace
 	{
 		std::uint32_t count = 0;
 		for (const auto& entry : g_trackedRefs) {
-			if (entry.ref != 0 && entry.applied) {
+			if (entry.ref != 0 && entry.gold.applied) {
 				++count;
 			}
 		}
@@ -621,17 +755,16 @@ namespace
 				entry.baseFormID = currentBaseFormID;
 				entry.loadHits = 1;
 				entry.loadGraphicsNode = a_loadGraphicsNode;
-				entry.applied = false;
+				entry.gold = GlowStackState{};
+				entry.highValue = GlowStackState{};
 				entry.hoverSeen = false;
 				entry.lastHasGold = false;
 				entry.lastGoldTotalCount = -1;
-				entry.activeStacks = 0;
 				entry.firstSeenMs = now;
 				entry.lastSeenMs = now;
 				entry.lastScanMs = 0;
 				entry.lastApplyMs = 0;
 				entry.lastRemoveMs = 0;
-				entry.effects.fill(nullptr);
 				CopyName(entry.name, a_name);
 				++g_counters.uniqueContainers;
 
@@ -651,51 +784,38 @@ namespace
 	}
 
 
-	bool RemoveGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	bool RemoveGlowStack(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, GlowStackState& a_state, RE::TESEffectShader* a_shader, RE::TESFormID a_shaderFormID, const char* a_label, const char* a_reason, bool a_logEvent)
 	{
 		if (!a_ref || !a_entry) {
 			return false;
 		}
 
-		if (!a_entry->applied) {
-			++g_counters.skippedAlreadyRemoved;
+		if (!a_state.applied) {
 			return true;
 		}
 
-		auto* shader = ResolveWinnerShader();
-		if (!shader) {
-			++g_counters.applyFailures;
-			REX::INFO("LootGlow remove failed: winner shader formID={:08X} did not resolve for ref={:016X}, reason={}",
-				g_settings.winnerShaderFormID,
+		if (!a_shader) {
+			REX::INFO("LootGlow {} remove failed: shader formID={:08X} did not resolve for ref={:016X}, reason={}",
+				a_label,
+				a_shaderFormID,
 				a_entry->ref,
 				a_reason ? a_reason : "<none>");
 			return false;
 		}
 
-		++g_counters.removeAttempts;
+		FinishMagicShaderHitEffect(a_ref, a_shader);
 
-		// This is the same recovered ProcessLists finish wrapper that was safe to call
-		// before re-applying. It should finish matching MagicShaderHitEffect
-		// instances for this ref/shader pair. We also clear the stored stack handles so
-		// the cache state agrees with the runtime intent even if the game defers cleanup.
-		FinishMagicShaderHitEffect(a_ref, shader);
-
-		const auto oldStacks = a_entry->activeStacks;
-		a_entry->applied = false;
-		a_entry->activeStacks = 0;
+		const auto previousStacks = a_state.activeStacks;
+		a_state = GlowStackState{};
 		a_entry->lastRemoveMs = NowMs();
-		a_entry->effects.fill(nullptr);
-		++g_counters.removeSuccesses;
-		MaybeLogTrackingStats("remove-success");
 
-		if (g_settings.debugLogging) {
-			REX::INFO("LootGlow removed/finished winner shader formID={:08X}: ref={:016X}, refForm={:08X}, baseForm={:08X}, previousStacks={}, activeGlowingRefs={}, reason={}, name={}",
-				g_settings.winnerShaderFormID,
+		if (a_logEvent) {
+			REX::INFO("[LootGlow] {} glow removed: ref={:016X}, refForm={:08X}, baseForm={:08X}, previousStacks={}, reason={}, name={}",
+				a_label,
 				a_entry->ref,
 				a_entry->refFormID,
 				a_entry->baseFormID,
-				oldStacks,
-				CountActiveGlowingRefs(),
+				previousStacks,
 				a_reason ? a_reason : "<none>",
 				a_entry->name[0] ? a_entry->name : "<unnamed>");
 		}
@@ -703,117 +823,163 @@ namespace
 		return true;
 	}
 
-	bool ApplyGlowToContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry)
+	bool ApplyGlowStack(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, GlowStackState& a_state, RE::TESEffectShader* a_shader, RE::TESFormID a_shaderFormID, std::uint32_t a_stackCount, const char* a_label, bool a_logEvent)
 	{
 		if (!a_ref || !a_entry) {
 			return false;
 		}
 
-		bool didRepair = false;
-
-		if (a_entry->applied) {
-			if (a_entry->activeStacks >= g_settings.glowStackCount) {
-				++g_counters.skippedAlreadyApplied;
-				return true;
-			}
-
-			didRepair = true;
-			++g_counters.repairAttempts;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] repairing incomplete/stale glow state: ref={:016X}, activeStacks={}, expectedStacks={}",
-					a_entry->ref,
-					a_entry->activeStacks,
-					g_settings.glowStackCount);
-			}
-			RemoveGlowFromContainer(a_ref, a_entry, "repair stale/incomplete applied state");
+		if (a_state.applied && a_state.activeStacks >= a_stackCount) {
+			return true;
 		}
 
-		auto* shader = ResolveWinnerShader();
-		if (!shader) {
-			++g_counters.applyFailures;
-			REX::INFO("LootGlow apply failed: winner shader formID={:08X} did not resolve for ref={:016X}, name={}",
-				g_settings.winnerShaderFormID,
+		if (!a_shader) {
+			REX::INFO("LootGlow {} apply failed: shader formID={:08X} did not resolve for ref={:016X}, name={}",
+				a_label,
+				a_shaderFormID,
 				a_entry->ref,
 				a_entry->name[0] ? a_entry->name : "<unnamed>");
 			return false;
 		}
 
-		++g_counters.applyAttempts;
-
-		// Remove any previous instance of this same shader for this ref, then add a clean stack.
-		FinishMagicShaderHitEffect(a_ref, shader);
+		FinishMagicShaderHitEffect(a_ref, a_shader);
 
 		void* processLists = GetProcessLists();
 		if (!processLists) {
-			++g_counters.applyFailures;
-			REX::INFO("LootGlow apply failed: ProcessLists singleton was null for ref={:016X}", a_entry->ref);
+			REX::INFO("LootGlow {} apply failed: ProcessLists singleton was null for ref={:016X}", a_label, a_entry->ref);
 			return false;
 		}
 
-		a_entry->activeStacks = 0;
-		a_entry->effects.fill(nullptr);
+		a_state.activeStacks = 0;
+		a_state.effects.fill(nullptr);
 
 		std::uint32_t stackSuccesses = 0;
-		for (std::uint32_t stackIndex = 0; stackIndex < g_settings.glowStackCount; ++stackIndex) {
-			void* effect = ConstructMagicShaderHitEffect(a_ref, shader, -1.0f);
+		for (std::uint32_t stackIndex = 0; stackIndex < a_stackCount; ++stackIndex) {
+			void* effect = ConstructMagicShaderHitEffect(a_ref, a_shader, -1.0f);
 			if (!effect) {
-				REX::INFO("LootGlow stack {}/{} failed: constructor returned null for ref={:016X}",
+				REX::INFO("LootGlow {} stack {}/{} failed: constructor returned null for ref={:016X}",
+					a_label,
 					stackIndex + 1,
-					g_settings.glowStackCount,
+					a_stackCount,
 					a_entry->ref);
 				continue;
 			}
 
 			if (!InitMagicShaderHitEffect(effect)) {
-				REX::INFO("LootGlow stack {}/{} failed: Init returned false for ref={:016X}",
+				REX::INFO("LootGlow {} stack {}/{} failed: init returned false for ref={:016X}",
+					a_label,
 					stackIndex + 1,
-					g_settings.glowStackCount,
+					a_stackCount,
 					a_entry->ref);
 				continue;
 			}
 
 			if (!EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-				REX::INFO("LootGlow stack {}/{} failed: po3 list insert failed for ref={:016X}",
+				REX::INFO("LootGlow {} stack {}/{} failed: list insert failed for ref={:016X}",
+					a_label,
 					stackIndex + 1,
-					g_settings.glowStackCount,
+					a_stackCount,
 					a_entry->ref);
 				continue;
 			}
 
-			a_entry->effects[stackIndex] = effect;
+			a_state.effects[stackSuccesses] = effect;
 			++stackSuccesses;
 		}
 
 		if (stackSuccesses == 0) {
-			++g_counters.applyFailures;
-			REX::INFO("LootGlow apply failed: no stacks inserted for ref={:016X}", a_entry->ref);
+			REX::INFO("LootGlow {} apply failed: no stacks inserted for ref={:016X}", a_label, a_entry->ref);
 			return false;
 		}
 
-		a_entry->applied = true;
-		a_entry->activeStacks = stackSuccesses;
+		a_state.applied = true;
+		a_state.activeStacks = stackSuccesses;
 		a_entry->lastApplyMs = NowMs();
-		if (didRepair) {
-			++g_counters.repairSuccesses;
-		}
-		++g_counters.applySuccesses;
-		MaybeLogTrackingStats(didRepair ? "repair-apply-success" : "apply-success");
 
-		if (g_settings.debugLogging) {
-			REX::INFO("LootGlow applied winner shader formID={:08X}: ref={:016X}, refForm={:08X}, baseForm={:08X}, loadNode={:016X}, stacks={}/{}, activeGlowingRefs={}, name={}",
-				g_settings.winnerShaderFormID,
+		if (a_logEvent) {
+			REX::INFO("[LootGlow] {} glow applied: ref={:016X}, refForm={:08X}, baseForm={:08X}, shader={:08X}, stacks={}/{}, name={}",
+				a_label,
 				a_entry->ref,
 				a_entry->refFormID,
 				a_entry->baseFormID,
-				a_entry->loadGraphicsNode,
+				a_shaderFormID,
 				stackSuccesses,
-				g_settings.glowStackCount,
-				CountActiveGlowingRefs(),
+				a_stackCount,
 				a_entry->name[0] ? a_entry->name : "<unnamed>");
 		}
 
-
 		return true;
+	}
+
+	bool RemoveGoldGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	{
+		if (!a_entry || !a_entry->gold.applied) {
+			++g_counters.skippedAlreadyRemoved;
+			return true;
+		}
+
+		auto* shader = ResolveWinnerShader();
+		if (!shader) {
+			++g_counters.applyFailures;
+			return false;
+		}
+
+		++g_counters.removeAttempts;
+		const bool removed = RemoveGlowStack(a_ref, a_entry, a_entry->gold, shader, g_settings.winnerShaderFormID, "gold", a_reason, g_settings.debugLogging);
+		if (removed) {
+			++g_counters.removeSuccesses;
+			MaybeLogTrackingStats("remove-success");
+		}
+		return removed;
+	}
+
+	bool ApplyGoldGlowToContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry)
+	{
+		if (!a_entry) {
+			return false;
+		}
+
+		bool didRepair = false;
+		if (a_entry->gold.applied) {
+			if (a_entry->gold.activeStacks >= g_settings.glowStackCount) {
+				++g_counters.skippedAlreadyApplied;
+				return true;
+			}
+			didRepair = true;
+			++g_counters.repairAttempts;
+			RemoveGoldGlowFromContainer(a_ref, a_entry, "repair stale/incomplete gold glow state");
+		}
+
+		auto* shader = ResolveWinnerShader();
+		if (!shader) {
+			++g_counters.applyFailures;
+			return false;
+		}
+
+		++g_counters.applyAttempts;
+		const bool applied = ApplyGlowStack(a_ref, a_entry, a_entry->gold, shader, g_settings.winnerShaderFormID, g_settings.glowStackCount, "gold", g_settings.debugLogging);
+		if (applied) {
+			if (didRepair) {
+				++g_counters.repairSuccesses;
+			}
+			++g_counters.applySuccesses;
+			MaybeLogTrackingStats(didRepair ? "repair-apply-success" : "apply-success");
+		} else {
+			++g_counters.applyFailures;
+		}
+		return applied;
+	}
+
+	bool RemoveHighValueGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	{
+		auto* shader = ResolveHighValueShader();
+		return RemoveGlowStack(a_ref, a_entry, a_entry->highValue, shader, g_settings.highValueShaderFormID, "high-value", a_reason, HighValueEventLoggingEnabled());
+	}
+
+	bool ApplyHighValueGlowToContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry)
+	{
+		auto* shader = ResolveHighValueShader();
+		return ApplyGlowStack(a_ref, a_entry, a_entry->highValue, shader, g_settings.highValueShaderFormID, g_settings.highValueGlowStackCount, "high-value", HighValueEventLoggingEnabled());
 	}
 }
 
@@ -896,6 +1062,187 @@ namespace LootGlow::GoldSelection
 	}
 
 
+	struct ItemValueResult
+	{
+		bool available{ false };
+		std::uint32_t value{ 0 };
+	};
+
+	template <class, class = void>
+	struct HasValueMember : std::false_type
+	{};
+
+	template <class T>
+	struct HasValueMember<T, std::void_t<decltype(std::declval<T*>()->value)>> : std::true_type
+	{};
+
+	template <class T>
+	ItemValueResult TryReadValueAs(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return {};
+		}
+
+		auto* typed = a_form->As<T>();
+		if (!typed) {
+			return {};
+		}
+
+		if constexpr (HasValueMember<T>::value) {
+			return { true, static_cast<std::uint32_t>(typed->value) };
+		} else {
+			return {};
+		}
+	}
+
+	ItemValueResult GetItemBaseGoldValue(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return {};
+		}
+
+#if LOOTGLOW_HAS_TESOBJECTMISC_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectMISC>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTWEAP_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectWEAP>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTARMO_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectARMO>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTBOOK_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectBOOK>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
+		if (auto value = TryReadValueAs<RE::AlchemyItem>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_INGREDIENTITEM_HEADER
+		if (auto value = TryReadValueAs<RE::IngredientItem>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESAMMO_HEADER
+		if (auto value = TryReadValueAs<RE::TESAmmo>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESSOULGEM_HEADER
+		if (auto value = TryReadValueAs<RE::TESSoulGem>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESKEY_HEADER
+		if (auto value = TryReadValueAs<RE::TESKey>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTCLOT_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectCLOT>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTAPPA_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectAPPA>(a_form); value.available) { return value; }
+#endif
+#if LOOTGLOW_HAS_TESOBJECTLIGH_HEADER
+		if (auto value = TryReadValueAs<RE::TESObjectLIGH>(a_form); value.available) { return value; }
+#endif
+
+		return {};
+	}
+
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER
+	template <class T>
+	RE::TESEnchantableForm* TryGetEnchantableFromConcrete(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return nullptr;
+		}
+
+		auto* typed = a_form->As<T>();
+		if (!typed) {
+			return nullptr;
+		}
+
+		return dynamic_cast<RE::TESEnchantableForm*>(typed);
+	}
+#endif
+
+	RE::TESEnchantableForm* GetEnchantableFormForValue(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return nullptr;
+		}
+
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_TESOBJECTWEAP_HEADER
+		if (auto* enchantable = TryGetEnchantableFromConcrete<RE::TESObjectWEAP>(a_form)) { return enchantable; }
+#endif
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_TESOBJECTARMO_HEADER
+		if (auto* enchantable = TryGetEnchantableFromConcrete<RE::TESObjectARMO>(a_form)) { return enchantable; }
+#endif
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_TESOBJECTBOOK_HEADER
+		if (auto* enchantable = TryGetEnchantableFromConcrete<RE::TESObjectBOOK>(a_form)) { return enchantable; }
+#endif
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_TESOBJECTCLOT_HEADER
+		if (auto* enchantable = TryGetEnchantableFromConcrete<RE::TESObjectCLOT>(a_form)) { return enchantable; }
+#endif
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_TESAMMO_HEADER
+		if (auto* enchantable = TryGetEnchantableFromConcrete<RE::TESAmmo>(a_form)) { return enchantable; }
+#endif
+
+		return nullptr;
+	}
+
+	float TryGetMagicItemCost(RE::EnchantmentItem* a_enchantment)
+	{
+#if LOOTGLOW_HAS_MAGICITEM_HEADER && LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER
+		if (!a_enchantment) {
+			return 0.0F;
+		}
+
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* magicItem = dynamic_cast<RE::MagicItem*>(a_enchantment);
+			if (!magicItem) {
+				return 0.0F;
+			}
+			return magicItem->GetCost(nullptr);
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0.0F;
+		}
+#endif
+#else
+		(void)a_enchantment;
+		return 0.0F;
+#endif
+	}
+
+	std::uint32_t EstimateFullGoldValue(RE::TESForm* a_form)
+	{
+		const auto baseValue = GetItemBaseGoldValue(a_form);
+		if (!baseValue.available) {
+			return 0;
+		}
+
+		std::uint32_t fullValue = baseValue.value;
+
+#if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER
+		auto* enchantable = GetEnchantableFormForValue(a_form);
+		if (!enchantable || !enchantable->formEnchanting) {
+			return fullValue;
+		}
+
+		auto* enchantment = enchantable->formEnchanting;
+		const auto magicItemCost = TryGetMagicItemCost(enchantment);
+		const auto exposedCost = enchantment->data.costOverride > 0 ? static_cast<float>(enchantment->data.costOverride) : 0.0F;
+		const auto rawCost = magicItemCost > 0.0F ? magicItemCost : exposedCost;
+		const auto amountOfEnchantment = static_cast<float>(enchantable->amountOfEnchantment);
+		const auto enchantValue = static_cast<std::uint32_t>((0.4F * (rawCost + amountOfEnchantment)) + 0.5F);
+		fullValue += enchantValue;
+#endif
+
+		return fullValue;
+	}
+
+	struct ContainerValueSummary
+	{
+		std::uint64_t knownFullValueTotal{ 0 };
+		std::uint32_t highestFullValueEach{ 0 };
+		std::uint32_t knownItems{ 0 };
+		std::uint32_t unknownItems{ 0 };
+	};
 	TrackedRef* EnsureTrackedHoverContainer(RE::TESObjectREFR* a_ref)
 	{
 		const auto ref = reinterpret_cast<std::uintptr_t>(a_ref);
@@ -926,6 +1273,36 @@ namespace LootGlow::GoldSelection
 		return GetFormID(a_form) == g_settings.goldFormID;
 	}
 
+	std::int32_t NormalizeBaseContainerCount(std::int32_t a_count)
+	{
+		return a_count < 0 ? -a_count : a_count;
+	}
+
+	std::int32_t EffectiveInventoryCount(std::int32_t a_baseCount, std::int32_t a_changeCount)
+	{
+		// Most container changes are baseCount + countDelta. During console-driven
+		// tests, added items can appear with a negative delta on some entries. Treat
+		// a negative delta larger than the base stack as an added stack, while still
+		// preserving the normal removal case, e.g. base 20 + delta -20 = 0.
+		if (a_changeCount < 0) {
+			const auto absDelta = -a_changeCount;
+			if (absDelta > a_baseCount) {
+				return a_baseCount + absDelta;
+			}
+		}
+
+		const auto total = a_baseCount + a_changeCount;
+		return total > 0 ? total : 0;
+	}
+
+	std::int32_t EffectiveInventoryCountFromChangeOnly(std::int32_t a_changeCount)
+	{
+		if (a_changeCount < 0) {
+			return -a_changeCount;
+		}
+		return a_changeCount > 0 ? a_changeCount : 0;
+	}
+
 	bool InspectAndApplyGoldGlow(RE::TESObjectREFR* a_ref, const char* a_source)
 	{
 		if (!a_ref) {
@@ -944,6 +1321,7 @@ namespace LootGlow::GoldSelection
 
 		std::int32_t goldTotalCount = 0;
 		bool hasGold = false;
+		ContainerValueSummary valueSummary{};
 
 		for (auto it = container->objectList.begin(); it != container->objectList.end(); ++it) {
 			auto* obj = reinterpret_cast<RE::ContainerObject*>(*it);
@@ -952,13 +1330,26 @@ namespace LootGlow::GoldSelection
 			}
 
 			auto* change = FindItemChange(changes, obj->type);
-			const auto baseCount = static_cast<std::int32_t>(std::abs(obj->count));
+			const auto baseCount = NormalizeBaseContainerCount(obj->count);
 			const auto changeCount = change ? change->count : 0;
-			const auto totalCount = baseCount + changeCount;
+			const auto totalCount = EffectiveInventoryCount(baseCount, changeCount);
 
-			if (totalCount > 0 && IsExactGoldForm(obj->type)) {
-				hasGold = true;
+			const bool isGold = IsExactGoldForm(obj->type);
+			if (totalCount > 0 && isGold) {
 				goldTotalCount += totalCount;
+			}
+
+			if (g_settings.highValueMode && totalCount > 0 && (!isGold || g_settings.highValueIncludeGold)) {
+				const auto fullValueEach = EstimateFullGoldValue(obj->type);
+				if (fullValueEach > 0) {
+					++valueSummary.knownItems;
+					valueSummary.knownFullValueTotal += static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(totalCount);
+					if (fullValueEach > valueSummary.highestFullValueEach) {
+						valueSummary.highestFullValueEach = fullValueEach;
+					}
+				} else {
+					++valueSummary.unknownItems;
+				}
 			}
 		}
 
@@ -973,13 +1364,28 @@ namespace LootGlow::GoldSelection
 					continue;
 				}
 
-				const auto totalCount = change->count;
-				if (totalCount > 0 && IsExactGoldForm(change->object)) {
-					hasGold = true;
+				const auto totalCount = EffectiveInventoryCountFromChangeOnly(change->count);
+				const bool isGold = IsExactGoldForm(change->object);
+				if (totalCount > 0 && isGold) {
 					goldTotalCount += totalCount;
+				}
+
+				if (g_settings.highValueMode && totalCount > 0 && (!isGold || g_settings.highValueIncludeGold)) {
+					const auto fullValueEach = EstimateFullGoldValue(change->object);
+					if (fullValueEach > 0) {
+						++valueSummary.knownItems;
+						valueSummary.knownFullValueTotal += static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(totalCount);
+						if (fullValueEach > valueSummary.highestFullValueEach) {
+							valueSummary.highestFullValueEach = fullValueEach;
+						}
+					} else {
+						++valueSummary.unknownItems;
+					}
 				}
 			}
 		}
+
+		hasGold = goldTotalCount > 0 && static_cast<std::uint32_t>(goldTotalCount) >= g_settings.goldCountThreshold;
 
 		if (hasGold) {
 			++g_counters.scanGoldPresent;
@@ -987,65 +1393,112 @@ namespace LootGlow::GoldSelection
 			++g_counters.scanGoldAbsent;
 		}
 
+		const bool qualifiesByTotal = g_settings.highValueMode && valueSummary.knownFullValueTotal >= g_settings.highValueThreshold;
+		const bool qualifiesBySingle = g_settings.highValueMode && valueSummary.highestFullValueEach >= g_settings.highValueThreshold;
+		const bool hasHighValue = qualifiesByTotal || qualifiesBySingle;
+
 		auto* entry = EnsureTrackedHoverContainer(a_ref);
 		if (!entry) {
 			if (hasGold && g_settings.debugLogging) {
-				REX::INFO("[LootGlow] {}: gold detected on untracked/non-container ref; skipping by design: ref={:016X}, goldTotalCount={}",
+				REX::INFO("[LootGlow] {}: gold detected on untracked/non-container ref; skipping by design: ref={:016X}, goldTotalCount={}, goldThreshold={}",
 					source,
 					reinterpret_cast<std::uintptr_t>(a_ref),
-					goldTotalCount);
+					goldTotalCount,
+					g_settings.goldCountThreshold);
 			}
 			return false;
 		}
 
 		entry->lastScanMs = NowMs();
 
-		const bool stateChanged = !entry->hoverSeen || entry->lastHasGold != hasGold || entry->lastGoldTotalCount != goldTotalCount;
-		if (stateChanged && g_settings.debugLogging) {
-			REX::INFO("[LootGlow] {} classification: ref={:016X}, refForm={:08X}, baseForm={:08X}, goldTotalCount={}, hasGold={}, applied={}, name={}",
+		const bool stateChanged =
+			!entry->hoverSeen ||
+			entry->lastHasGold != hasGold ||
+			entry->lastGoldTotalCount != goldTotalCount ||
+			entry->lastHasHighValue != hasHighValue ||
+			entry->lastKnownFullValueTotal != valueSummary.knownFullValueTotal ||
+			entry->lastHighestFullValueEach != valueSummary.highestFullValueEach;
+
+		if (stateChanged && GoldSummaryLoggingEnabled()) {
+			REX::INFO("[LootGlow] {} classification: ref={:016X}, refForm={:08X}, baseForm={:08X}, goldTotalCount={}, goldThreshold={}, hasGold={}, highValue={}, knownFullValueTotal={}, highestFullValueEach={}, goldApplied={}, highValueApplied={}, name={}",
 				source,
 				reinterpret_cast<std::uintptr_t>(a_ref),
 				GetFormID(a_ref),
 				entry->baseFormID,
 				goldTotalCount,
+				g_settings.goldCountThreshold,
 				hasGold,
-				entry->applied,
+				hasHighValue,
+				valueSummary.knownFullValueTotal,
+				valueSummary.highestFullValueEach,
+				entry->gold.applied,
+				entry->highValue.applied,
 				entry->name[0] ? entry->name : "<unnamed>");
 		}
+		if (stateChanged && g_settings.highValueMode && HighValueSummaryLoggingEnabled()) {
+			REX::INFO("[LootGlow] {} high-value summary: ref={:016X}, refForm={:08X}, knownFullValueTotal={}, highestFullValueEach={}, threshold={}, hasHighValue={}, qualifiesByTotal={}, qualifiesBySingle={}, knownItems={}, unknownItems={}, includeGold={}",
+				source,
+				reinterpret_cast<std::uintptr_t>(a_ref),
+				GetFormID(a_ref),
+				valueSummary.knownFullValueTotal,
+				valueSummary.highestFullValueEach,
+				g_settings.highValueThreshold,
+				hasHighValue,
+				qualifiesByTotal,
+				qualifiesBySingle,
+				valueSummary.knownItems,
+				valueSummary.unknownItems,
+				g_settings.highValueIncludeGold);
+		}
+
 		if (stateChanged) {
 			entry->hoverSeen = true;
 			entry->lastHasGold = hasGold;
+			entry->lastHasHighValue = hasHighValue;
 			entry->lastGoldTotalCount = goldTotalCount;
+			entry->lastKnownFullValueTotal = valueSummary.knownFullValueTotal;
+			entry->lastHighestFullValueEach = valueSummary.highestFullValueEach;
 		}
 
+		bool changedGlow = false;
+
 		if (!hasGold) {
-			if (entry->applied) {
-				if (g_settings.debugLogging) {
-					REX::INFO("[LootGlow] {}: GOLD REMOVED/ABSENT -> finishing glow: ref={:016X}, refForm={:08X}, goldTotalCount={}",
+			if (entry->gold.applied) {
+				if (GoldEventLoggingEnabled()) {
+					REX::INFO("[LootGlow] {}: gold glow removed: ref={:016X}, refForm={:08X}, goldTotalCount={}, goldThreshold={}",
+						source,
+						reinterpret_cast<std::uintptr_t>(a_ref),
+						GetFormID(a_ref),
+						goldTotalCount,
+						g_settings.goldCountThreshold);
+				}
+				changedGlow = ::RemoveGoldGlowFromContainer(a_ref, entry, "hovered container gold count below threshold") || changedGlow;
+			}
+		} else if (!entry->gold.applied || entry->gold.activeStacks < g_settings.glowStackCount) {
+			if (GoldEventLoggingEnabled()) {
+				REX::INFO("[LootGlow] {}: gold glow applied: ref={:016X}, refForm={:08X}, goldTotalCount={}, goldThreshold={}",
 					source,
 					reinterpret_cast<std::uintptr_t>(a_ref),
 					GetFormID(a_ref),
-					goldTotalCount);
-				}
-				return ::RemoveGlowFromContainer(a_ref, entry, "hovered container has no positive-count gold");
+					goldTotalCount,
+					g_settings.goldCountThreshold);
 			}
-
-			return false;
+			changedGlow = ::ApplyGoldGlowToContainer(a_ref, entry) || changedGlow;
 		}
 
-		if (entry->applied && entry->activeStacks >= g_settings.glowStackCount) {
-			return true;
+		if (g_settings.highValueMode) {
+			if (!hasHighValue) {
+				if (entry->highValue.applied) {
+					changedGlow = ::RemoveHighValueGlowFromContainer(a_ref, entry, "container no longer meets high-value threshold") || changedGlow;
+				}
+			} else if (!entry->highValue.applied || entry->highValue.activeStacks < g_settings.highValueGlowStackCount) {
+				changedGlow = ::ApplyHighValueGlowToContainer(a_ref, entry) || changedGlow;
+			}
+		} else if (entry->highValue.applied) {
+			changedGlow = ::RemoveHighValueGlowFromContainer(a_ref, entry, "high-value mode disabled") || changedGlow;
 		}
 
-		if (g_settings.debugLogging) {
-			REX::INFO("[LootGlow] {}: GOLD CONFIRMED -> applying glow: ref={:016X}, refForm={:08X}, goldTotalCount={}",
-			source,
-			reinterpret_cast<std::uintptr_t>(a_ref),
-			GetFormID(a_ref),
-			goldTotalCount);
-		}
-
-		return ::ApplyGlowToContainer(a_ref, entry);
+		return changedGlow || hasGold || hasHighValue;
 	}
 
 	void ProcessDelayedRescans()
@@ -1170,13 +1623,20 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	LoadSettings();
 
 	REX::INFO("========================");
-	REX::INFO("LootGlow v0.1.1 V69B stability summary initialized");
-	REX::INFO("Configured shader={:08X}, goldFormID={:08X}, stacks={}, debugLogging={}",
-		g_settings.winnerShaderFormID,
-		g_settings.goldFormID,
-		g_settings.glowStackCount,
-		g_settings.debugLogging);
-	REX::INFO("Gold-containing loaded containers will glow automatically; hover/open updates plus delayed rescans repair/remove glow after inventory changes.");
+	REX::INFO("LootGlow v0.2.0 V74C initialized");
+	REX::INFO("Gold glow: threshold={} gold", g_settings.goldCountThreshold);
+	REX::INFO("High-value glow: enabled={}, threshold={} value", g_settings.highValueMode, g_settings.highValueThreshold);
+	if (g_settings.debugLogging || g_settings.goldLogging != 0 || g_settings.highValueLogging != 0) {
+		REX::INFO("Advanced settings: goldShader={:08X}, goldStacks={}, highValueShader={:08X}, highValueStacks={}, includeGold={}, goldLogging={}, highValueLogging={}, debugLogging={}",
+			g_settings.winnerShaderFormID,
+			g_settings.glowStackCount,
+			g_settings.highValueShaderFormID,
+			g_settings.highValueGlowStackCount,
+			g_settings.highValueIncludeGold,
+			g_settings.goldLogging,
+			g_settings.highValueLogging,
+			g_settings.debugLogging);
+	}
 	MaybeLogTrackingStats("startup", true);
 	REX::INFO("========================");
 	return true;
