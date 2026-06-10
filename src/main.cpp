@@ -686,7 +686,8 @@ namespace
 	{
 		std::uint32_t count = 0;
 		for (const auto& entry : g_trackedRefs) {
-			if (entry.ref != 0 && entry.gold.applied) {
+			if (entry.ref != 0 &&
+				(entry.gold.applied || entry.highValue.applied || entry.lockpick.applied)) {
 				++count;
 			}
 		}
@@ -713,6 +714,17 @@ namespace
 		return false;
 	}
 
+	bool ImportantStabilityReason(const char* a_reason)
+	{
+		if (!a_reason) {
+			return false;
+		}
+		return std::strcmp(a_reason, "table-full") == 0 ||
+			std::strcmp(a_reason, "delayed-queue-full") == 0 ||
+			std::strcmp(a_reason, "pointer-reuse-reset") == 0 ||
+			std::strcmp(a_reason, "delayed-exception") == 0;
+	}
+
 	void MaybeLogTrackingStats(const char* a_reason, bool a_force = false)
 	{
 		const auto now = NowMs();
@@ -722,15 +734,16 @@ namespace
 			MilestoneReached(g_counters.removeSuccesses, g_lastStatsRemoveSuccesses) ||
 			MilestoneReached(g_counters.delayedRescansProcessed, g_lastStatsDelayedProcessed);
 
-		const bool warningState =
-			g_counters.trackingTableFull != 0 ||
-			g_counters.delayedRescanQueueFull != 0 ||
-			g_counters.delayedRescanExceptions != 0 ||
-			g_counters.pointerReuseResets != 0;
-
-		if (!a_force && !g_settings.debugLogging && !warningState) {
-			return;
+		// Production logs should stay quiet. Stability summaries are useful while
+		// debugging, but persistent counters such as delayedRescanExceptions can make
+		// normal play logs noisy if they are treated as a permanent warning state.
+		// Outside DebugLogging, only forced one-off serious events are reported.
+		if (!g_settings.debugLogging) {
+			if (!a_force || !ImportantStabilityReason(a_reason)) {
+				return;
+			}
 		}
+
 		if (!a_force && !milestone && g_lastStatsLogMs != 0 && now - g_lastStatsLogMs < kStatsLogIntervalMs) {
 			return;
 		}
@@ -1057,9 +1070,29 @@ namespace
 		return applied;
 	}
 
-	bool RemoveHighValueGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	bool RemoveHighValueGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason, bool a_forceFinish = false)
 	{
 		auto* shader = ResolveHighValueShader();
+		if (a_forceFinish && a_ref && a_entry && shader && !a_entry->highValue.applied) {
+			// Safety cleanup mirrors the lockpick path. If tracking was reset or
+			// otherwise believes the category is inactive while the previous scan
+			// still qualified, drain a full high-value stack from this ref.
+			GlowStackState fallback{};
+			fallback.activeStacks = g_settings.highValueGlowStackCount;
+			FinishGlowStackEffects(a_ref, shader, fallback, g_settings.highValueGlowStackCount);
+			a_entry->highValue = GlowStackState{};
+			a_entry->lastRemoveMs = NowMs();
+			if (HighValueEventLoggingEnabled()) {
+				REX::INFO("[LootGlow] high-value glow safety cleanup: ref={:016X}, refForm={:08X}, baseForm={:08X}, reason={}, name={}",
+					a_entry->ref,
+					a_entry->refFormID,
+					a_entry->baseFormID,
+					a_reason ? a_reason : "<none>",
+					a_entry->name[0] ? a_entry->name : "<unnamed>");
+			}
+			return true;
+		}
+
 		return RemoveGlowStack(a_ref, a_entry, a_entry->highValue, shader, g_settings.highValueShaderFormID, "high-value", a_reason, HighValueEventLoggingEnabled());
 	}
 
@@ -1475,9 +1508,15 @@ namespace LootGlow::GoldSelection
 
 	std::int32_t EffectiveInventoryCountFromChangeOnly(std::int32_t a_changeCount)
 	{
-		if (a_changeCount < 0) {
-			return -a_changeCount;
-		}
+		// Runtime-only InventoryChanges entries represent the current stack count
+		// for items that are not part of the base/editor container contents.
+		//
+		// A negative or zero count here means the runtime stack is gone. Earlier
+		// development builds treated negative change-only counts as positive
+		// removal deltas, which could make a looted high-value item continue to
+		// qualify and leave its glow behind. Base/container items still use
+		// EffectiveInventoryCount(), where negative values are reconciled against
+		// the base count.
 		return a_changeCount > 0 ? a_changeCount : 0;
 	}
 
@@ -1604,6 +1643,7 @@ namespace LootGlow::GoldSelection
 
 		entry->lastScanMs = NowMs();
 
+		const bool previousHasHighValue = entry->hoverSeen && entry->lastHasHighValue;
 		const bool previousHasLockpicks = entry->hoverSeen && entry->lastHasLockpicks;
 
 		const bool stateChanged =
@@ -1706,8 +1746,8 @@ namespace LootGlow::GoldSelection
 
 		if (g_settings.highValueMode) {
 			if (!hasHighValue) {
-				if (entry->highValue.applied) {
-					changedGlow = ::RemoveHighValueGlowFromContainer(a_ref, entry, "container no longer meets high-value threshold") || changedGlow;
+				if (entry->highValue.applied || previousHasHighValue) {
+					changedGlow = ::RemoveHighValueGlowFromContainer(a_ref, entry, "container no longer meets high-value threshold", previousHasHighValue) || changedGlow;
 				}
 			} else if (!entry->highValue.applied || entry->highValue.activeStacks < g_settings.highValueGlowStackCount) {
 				changedGlow = ::ApplyHighValueGlowToContainer(a_ref, entry) || changedGlow;
@@ -1852,8 +1892,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 
 	LoadSettings();
 
-	REX::INFO("========================");
-	REX::INFO("LootGlow v0.3.0 V77B production initialized");
+	REX::INFO("LootGlow v0.3.0 V77D production initialized");
 	REX::INFO("Gold glow: threshold={} gold", g_settings.goldCountThreshold);
 	REX::INFO("High-value glow: enabled={}, threshold={} value, aggregateMode={}", g_settings.highValueMode, g_settings.highValueThreshold, g_settings.highValueAggregateMode);
 	REX::INFO("Lockpick glow: enabled={}, formID={:08X}, threshold={}, shader={:08X}, stacks={}",
@@ -1862,7 +1901,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 		g_settings.lockpickCountThreshold,
 		g_settings.lockpickShaderFormID,
 		g_settings.lockpickGlowStackCount);
-	if (g_settings.debugLogging || g_settings.goldLogging != 0 || g_settings.highValueLogging != 0 || g_settings.lockpickLogging != 0) {
+	if (g_settings.debugLogging) {
 		REX::INFO("Advanced settings: goldShader={:08X}, goldStacks={}, highValueShader={:08X}, highValueStacks={}, includeGold={}, aggregateMode={}, goldLogging={}, highValueLogging={}, lockpickMode={}, lockpickFormID={:08X}, lockpickThreshold={}, lockpickShader={:08X}, lockpickStacks={}, lockpickLogging={}, debugLogging={}",
 			g_settings.winnerShaderFormID,
 			g_settings.glowStackCount,
@@ -1883,6 +1922,5 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	if (g_settings.debugLogging) {
 		MaybeLogTrackingStats("startup", true);
 	}
-	REX::INFO("========================");
 	return true;
 }
