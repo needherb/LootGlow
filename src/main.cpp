@@ -19,6 +19,7 @@
 // the runtime addresses and layout recovered from powerof3's Oblivion
 // Remastered Unread Books Glow DLL.
 #include "RE/T/TESFullName.h"
+#include "RE/E/EffectSetting.h"
 #if __has_include("RE/T/TESObjectMISC.h")
 #	include "RE/T/TESObjectMISC.h"
 #	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 1
@@ -118,11 +119,15 @@ namespace
 	// the current stable LootGlow release.
 	constexpr RE::TESFormID kDefaultWinnerShaderFormID = 0x000C793F;
 	constexpr RE::TESFormID kDefaultGoldFormID = 0x0000000F;
+	constexpr RE::TESFormID kDefaultLockpickFormID = 0x0000000A;
 	constexpr std::uint32_t kDefaultGlowStackCount = 8;
 	constexpr std::uint32_t kDefaultGoldCountThreshold = 100;
 	constexpr RE::TESFormID kDefaultHighValueShaderFormID = 0x000C793E;
 	constexpr std::uint32_t kDefaultHighValueGlowStackCount = 6;
 	constexpr std::uint32_t kDefaultHighValueThreshold = 250;
+	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;  // STRP / Soul Trap hit shader
+	constexpr RE::TESFormID kDefaultMagicEffectProbeMaxFormID = 0x00200000;
+	constexpr std::uint32_t kDefaultLockpickGlowStackCount = 4;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
 	constexpr std::uint32_t kMaxTrackedRefs = 8192;
 	constexpr std::uint32_t kMaxDelayedRescans = 256;
@@ -136,12 +141,21 @@ namespace
 		RE::TESFormID goldFormID{ kDefaultGoldFormID };
 		std::uint32_t goldCountThreshold{ kDefaultGoldCountThreshold };
 		std::uint32_t goldLogging{ 0 };
+		bool lockpickMode{ true };
+		RE::TESFormID lockpickFormID{ kDefaultLockpickFormID };
+		std::uint32_t lockpickCountThreshold{ 1 };
+		RE::TESFormID lockpickShaderFormID{ kDefaultLockpickShaderFormID };
+		std::uint32_t lockpickGlowStackCount{ kDefaultLockpickGlowStackCount };
+		std::uint32_t lockpickLogging{ 0 };
+		bool magicEffectProbeLogging{ false };
+		RE::TESFormID magicEffectProbeMaxFormID{ kDefaultMagicEffectProbeMaxFormID };
 		std::uint32_t glowStackCount{ kDefaultGlowStackCount };
 		bool debugLogging{ false };
 
 		bool highValueMode{ true };
 		std::uint32_t highValueLogging{ 0 };
 		bool highValueIncludeGold{ false };
+		bool highValueAggregateMode{ true };
 		std::uint32_t highValueThreshold{ kDefaultHighValueThreshold };
 		RE::TESFormID highValueShaderFormID{ kDefaultHighValueShaderFormID };
 		std::uint32_t highValueGlowStackCount{ kDefaultHighValueGlowStackCount };
@@ -169,6 +183,16 @@ namespace
 		return g_settings.debugLogging || g_settings.highValueLogging >= 2;
 	}
 
+	bool LockpickEventLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.lockpickLogging >= 1;
+	}
+
+	bool LockpickSummaryLoggingEnabled()
+	{
+		return g_settings.debugLogging || g_settings.lockpickLogging >= 2;
+	}
+
 	constexpr std::uintptr_t kMagicShaderHitEffectSize = 0xA0;
 	constexpr std::uintptr_t kMagicShaderHitEffectBSTempEffectOffset = 0x18;
 	constexpr std::uintptr_t kProcessListsMagicEffectHeadItemOffset = 0x90;
@@ -191,10 +215,13 @@ namespace
 		std::uintptr_t loadGraphicsNode{ 0 };
 		GlowStackState gold{};
 		GlowStackState highValue{};
+		GlowStackState lockpick{};
 		bool hoverSeen{ false };
 		bool lastHasGold{ false };
 		bool lastHasHighValue{ false };
+		bool lastHasLockpicks{ false };
 		std::int32_t lastGoldTotalCount{ -1 };
+		std::int32_t lastLockpickTotalCount{ -1 };
 		std::uint64_t lastKnownFullValueTotal{ 0 };
 		std::uint32_t lastHighestFullValueEach{ 0 };
 		std::uint64_t firstSeenMs{ 0 };
@@ -243,11 +270,13 @@ namespace
 	static Counters g_counters{};
 	static RE::TESEffectShader* g_shader{ nullptr };
 	static RE::TESEffectShader* g_highValueShader{ nullptr };
+	static RE::TESEffectShader* g_lockpickShader{ nullptr };
 	static std::uint64_t g_lastStatsLogMs{ 0 };
 	static std::uint64_t g_lastStatsUniqueContainers{ 0 };
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
 	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
 	static std::uint64_t g_lastStatsDelayedProcessed{ 0 };
+	static bool g_magicEffectProbeDone{ false };
 
 	std::uint32_t ClampStackCount(std::uint32_t a_value)
 	{
@@ -290,11 +319,26 @@ namespace
 			g_settings.goldCountThreshold = 1;
 		}
 		g_settings.goldLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "GoldLogging", 0, a_path));
+		g_settings.lockpickMode = GetPrivateProfileIntA("LootGlow", "LockpickMode", 1, a_path) != 0;
+		g_settings.lockpickFormID = ReadHexFormIDSetting(a_path, "LockpickFormID", kDefaultLockpickFormID);
+		g_settings.lockpickCountThreshold = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "LockpickCountThreshold", 1, a_path));
+		if (g_settings.lockpickCountThreshold == 0) {
+			g_settings.lockpickCountThreshold = 1;
+		}
+		g_settings.lockpickShaderFormID = ReadHexFormIDSetting(a_path, "LockpickShaderFormID", kDefaultLockpickShaderFormID);
+		g_settings.lockpickGlowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "LockpickStackCount", kDefaultLockpickGlowStackCount, a_path)));
+		g_settings.lockpickLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "LockpickLogging", 0, a_path));
+		g_settings.magicEffectProbeLogging = GetPrivateProfileIntA("LootGlow", "MagicEffectProbeLogging", 0, a_path) != 0;
+		g_settings.magicEffectProbeMaxFormID = ReadHexFormIDSetting(a_path, "MagicEffectProbeMaxFormID", kDefaultMagicEffectProbeMaxFormID);
+		if (g_settings.magicEffectProbeMaxFormID == 0) {
+			g_settings.magicEffectProbeMaxFormID = kDefaultMagicEffectProbeMaxFormID;
+		}
 		g_settings.glowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "StackCount", kDefaultGlowStackCount, a_path)));
 		g_settings.debugLogging = GetPrivateProfileIntA("LootGlow", "DebugLogging", 0, a_path) != 0;
 		g_settings.highValueMode = GetPrivateProfileIntA("LootGlow", "HighValueMode", 1, a_path) != 0;
 		g_settings.highValueLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueLogging", 0, a_path));
 		g_settings.highValueIncludeGold = GetPrivateProfileIntA("LootGlow", "HighValueIncludeGold", 0, a_path) != 0;
+		g_settings.highValueAggregateMode = GetPrivateProfileIntA("LootGlow", "HighValueAggregateMode", 1, a_path) != 0;
 		g_settings.highValueThreshold = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueThreshold", kDefaultHighValueThreshold, a_path));
 		g_settings.highValueShaderFormID = ReadHexFormIDSetting(a_path, "HighValueShaderFormID", kDefaultHighValueShaderFormID);
 		g_settings.highValueGlowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueStackCount", kDefaultHighValueGlowStackCount, a_path)));
@@ -399,6 +443,7 @@ namespace
 	using EffectInitFn = bool (*)(void*);
 	using ProcessListsGetterFn = void* (*)();
 	using FinishMagicShaderHitEffectFn = void (*)(void*, RE::TESObjectREFR*, RE::TESEffectShader*);
+	using EffectSettingCollectionGetterFn = void* (*)();
 
 	bool LooksPointerish(std::uintptr_t a_value)
 	{
@@ -472,6 +517,27 @@ namespace
 		}
 
 		return g_highValueShader;
+	}
+
+	RE::TESEffectShader* ResolveLockpickShader()
+	{
+		if (g_lockpickShader) {
+			return g_lockpickShader;
+		}
+
+		g_lockpickShader = RE::TESForm::LookupByID<RE::TESEffectShader>(g_settings.lockpickShaderFormID);
+		if (g_lockpickShader) {
+			if (g_settings.debugLogging) {
+				REX::INFO("LootGlow lockpick shader resolved: ptr={:016X}, formID={:08X}",
+					reinterpret_cast<std::uintptr_t>(g_lockpickShader),
+					g_settings.lockpickShaderFormID);
+			}
+		} else {
+			++g_counters.shaderResolveFailures;
+			REX::INFO("LootGlow lockpick shader lookup failed/not ready: formID={:08X}", g_settings.lockpickShaderFormID);
+		}
+
+		return g_lockpickShader;
 	}
 
 	void* AllocateGameObject(std::uint64_t a_size)
@@ -757,9 +823,13 @@ namespace
 				entry.loadGraphicsNode = a_loadGraphicsNode;
 				entry.gold = GlowStackState{};
 				entry.highValue = GlowStackState{};
+				entry.lockpick = GlowStackState{};
 				entry.hoverSeen = false;
 				entry.lastHasGold = false;
+				entry.lastHasHighValue = false;
+				entry.lastHasLockpicks = false;
 				entry.lastGoldTotalCount = -1;
+				entry.lastLockpickTotalCount = -1;
 				entry.firstSeenMs = now;
 				entry.lastSeenMs = now;
 				entry.lastScanMs = 0;
@@ -981,6 +1051,18 @@ namespace
 		auto* shader = ResolveHighValueShader();
 		return ApplyGlowStack(a_ref, a_entry, a_entry->highValue, shader, g_settings.highValueShaderFormID, g_settings.highValueGlowStackCount, "high-value", HighValueEventLoggingEnabled());
 	}
+
+	bool RemoveLockpickGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	{
+		auto* shader = ResolveLockpickShader();
+		return RemoveGlowStack(a_ref, a_entry, a_entry->lockpick, shader, g_settings.lockpickShaderFormID, "lockpick", a_reason, LockpickEventLoggingEnabled());
+	}
+
+	bool ApplyLockpickGlowToContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry)
+	{
+		auto* shader = ResolveLockpickShader();
+		return ApplyGlowStack(a_ref, a_entry, a_entry->lockpick, shader, g_settings.lockpickShaderFormID, g_settings.lockpickGlowStackCount, "lockpick", LockpickEventLoggingEnabled());
+	}
 }
 
 
@@ -1061,6 +1143,208 @@ namespace LootGlow::GoldSelection
 		return a_form ? static_cast<std::uint32_t>(a_form->GetFormID()) : 0;
 	}
 
+	struct MagicEffectProbeTarget
+	{
+		char code[5];
+		bool found{ false };
+	};
+
+	bool EffectCodeEquals(const std::byte (&a_effectID)[4], const char* a_code)
+	{
+		return static_cast<char>(a_effectID[0]) == a_code[0] &&
+		       static_cast<char>(a_effectID[1]) == a_code[1] &&
+		       static_cast<char>(a_effectID[2]) == a_code[2] &&
+		       static_cast<char>(a_effectID[3]) == a_code[3];
+	}
+
+	void CopyEffectCode(char (&a_dst)[5], const std::byte (&a_effectID)[4])
+	{
+		a_dst[0] = static_cast<char>(a_effectID[0]);
+		a_dst[1] = static_cast<char>(a_effectID[1]);
+		a_dst[2] = static_cast<char>(a_effectID[2]);
+		a_dst[3] = static_cast<char>(a_effectID[3]);
+		a_dst[4] = '\0';
+	}
+
+	std::uint32_t PackEffectCode(const char* a_code)
+	{
+		return static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[0])) |
+		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[1])) << 8) |
+		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[2])) << 16) |
+		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[3])) << 24);
+	}
+
+	struct EffectSettingMapNode
+	{
+		EffectSettingMapNode* next;      // 00
+		std::uint32_t         key;       // 08 - packed effect code, e.g. FISH = 0x48534946
+		std::uint32_t         pad0C;     // 0C
+		RE::EffectSetting*    value;     // 10
+	};
+	static_assert(sizeof(EffectSettingMapNode) == 0x18);
+
+	struct EffectSettingMapLayout
+	{
+		void*                 vtable;       // 00
+		std::uint32_t         bucketCount;  // 08 - initialized to 0x25 by FUN_146887AC0
+		std::uint32_t         pad0C;        // 0C
+		EffectSettingMapNode** buckets;     // 10
+		std::uint64_t         itemCount;    // 18 - Ghidra writes low 32 bits as count
+	};
+	static_assert(sizeof(EffectSettingMapLayout) == 0x20);
+
+	void* GetEffectSettingCollection()
+	{
+		// FUN_146887AC0: lazy singleton getter for EffectSettingCollection / NiTMap<EffectID, EffectSetting*>.
+		REL::Relocation<EffectSettingCollectionGetterFn> fn{ REL::Offset{ 0x06887AC0 } };
+		return fn();
+	}
+
+	void LogMagicEffectProbeHit(const char* a_requestedCode, RE::EffectSetting* a_effect, std::uint32_t a_key, std::uint32_t a_bucket, std::uint32_t a_depth)
+	{
+		if (!a_effect) {
+			return;
+		}
+
+		auto* hitShader = a_effect->data.effectShader;
+		auto* enchantShader = a_effect->data.enchantEffect;
+		char actualCode[5]{};
+		CopyEffectCode(actualCode, a_effect->effectID);
+
+		REX::INFO("[LootGlow] MGEF probe hit: requested={} actual={} key={:08X} effectForm={:08X} ptr={:016X} hitShader={:08X} hitPtr={:016X} enchantShader={:08X} enchantPtr={:016X} baseCost={:.4f} school={} flags={:08X} bucket={} depth={}",
+			a_requestedCode ? a_requestedCode : "????",
+			actualCode,
+			a_key,
+			GetFormID(a_effect),
+			reinterpret_cast<std::uintptr_t>(a_effect),
+			GetFormID(hitShader),
+			reinterpret_cast<std::uintptr_t>(hitShader),
+			GetFormID(enchantShader),
+			reinterpret_cast<std::uintptr_t>(enchantShader),
+			a_effect->data.baseCost,
+			static_cast<std::int32_t>(a_effect->data.magicSchool),
+			a_effect->data.flags,
+			a_bucket,
+			a_depth);
+	}
+
+	void MaybeRunMagicEffectShaderProbe(const char* a_reason)
+	{
+		if (!g_settings.magicEffectProbeLogging || g_magicEffectProbeDone) {
+			return;
+		}
+
+		g_magicEffectProbeDone = true;
+
+		std::array<MagicEffectProbeTarget, 17> targets{{
+			// Known controls / already-tested candidates
+			{{ 'D', 'T', 'C', 'T', '\0' }, false}, // Detect Life
+			{{ 'F', 'I', 'S', 'H', '\0' }, false}, // Fire Shield
+			{{ 'F', 'R', 'S', 'H', '\0' }, false}, // Frost Shield
+			{{ 'L', 'I', 'S', 'H', '\0' }, false}, // Shock/Lightning Shield
+			{{ 'S', 'H', 'L', 'D', '\0' }, false}, // Shield
+
+			// Distinct visual candidates for lockpick glow
+			{{ 'S', 'T', 'R', 'P', '\0' }, false}, // Soul Trap
+			{{ 'S', 'A', 'B', 'S', '\0' }, false}, // Spell Absorption
+			{{ 'R', 'F', 'L', 'C', '\0' }, false}, // Reflect Spell
+			{{ 'R', 'E', 'D', 'G', '\0' }, false}, // Reflect Damage
+			{{ 'P', 'A', 'R', 'A', '\0' }, false}, // Paralyze
+			{{ 'S', 'L', 'N', 'C', '\0' }, false}, // Silence
+			{{ 'T', 'U', 'R', 'N', '\0' }, false}, // Turn Undead
+			{{ 'R', 'E', 'A', 'N', '\0' }, false}, // Reanimate
+
+			// Earlier interesting-but-likely-empty controls
+			{{ 'Z', 'L', 'I', 'C', '\0' }, false}, // Summon Lich
+			{{ 'D', 'U', 'M', 'Y', '\0' }, false}, // Mehrunes Dagon Custom Effect
+
+			// Extra color/contrast references
+			{{ 'F', 'I', 'D', 'G', '\0' }, false}, // Fire Damage
+			{{ 'S', 'H', 'D', 'G', '\0' }, false}, // Shock Damage
+		}};
+
+		REX::INFO("[LootGlow] MGEF probe starting: reason={}, method=EffectSettingCollection-map-walk",
+			a_reason ? a_reason : "unknown");
+
+		std::uint32_t nodesSeen = 0;
+		std::uint32_t effectValuesSeen = 0;
+		std::uint32_t targetHits = 0;
+
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* rawMap = GetEffectSettingCollection();
+			auto* map = reinterpret_cast<EffectSettingMapLayout*>(rawMap);
+			if (!LooksPointerish(reinterpret_cast<std::uintptr_t>(map)) || !LooksPointerish(reinterpret_cast<std::uintptr_t>(map->buckets))) {
+				REX::INFO("[LootGlow] MGEF probe failed: invalid EffectSettingCollection map/buckets. map={:016X}",
+					reinterpret_cast<std::uintptr_t>(map));
+				return;
+			}
+
+			const auto bucketCount = map->bucketCount;
+			if (bucketCount == 0 || bucketCount > 4096) {
+				REX::INFO("[LootGlow] MGEF probe failed: suspicious bucketCount={} map={:016X}",
+					bucketCount,
+					reinterpret_cast<std::uintptr_t>(map));
+				return;
+			}
+
+			REX::INFO("[LootGlow] MGEF probe map: map={:016X} buckets={:016X} bucketCount={} itemCount={}",
+				reinterpret_cast<std::uintptr_t>(map),
+				reinterpret_cast<std::uintptr_t>(map->buckets),
+				bucketCount,
+				static_cast<std::uint32_t>(map->itemCount));
+
+			for (std::uint32_t bucket = 0; bucket < bucketCount; ++bucket) {
+				auto* node = map->buckets[bucket];
+				std::uint32_t depth = 0;
+				while (LooksPointerish(reinterpret_cast<std::uintptr_t>(node)) && depth < 1024) {
+					++nodesSeen;
+					auto* effect = node->value;
+					if (LooksPointerish(reinterpret_cast<std::uintptr_t>(effect))) {
+						++effectValuesSeen;
+						for (auto& target : targets) {
+							if (target.found) {
+								continue;
+							}
+
+							const auto packed = PackEffectCode(target.code);
+							if (node->key == packed || EffectCodeEquals(effect->effectID, target.code)) {
+								target.found = true;
+								++targetHits;
+								LogMagicEffectProbeHit(target.code, effect, node->key, bucket, depth);
+							}
+						}
+					}
+
+					if (targetHits == targets.size()) {
+						break;
+					}
+
+					node = node->next;
+					++depth;
+				}
+
+				if (targetHits == targets.size()) {
+					break;
+				}
+			}
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			REX::INFO("[LootGlow] MGEF probe failed: exception while walking EffectSettingCollection map");
+			return;
+		}
+#endif
+
+		for (const auto& target : targets) {
+			if (!target.found) {
+				REX::INFO("[LootGlow] MGEF probe miss: code={} packed={:08X}", target.code, PackEffectCode(target.code));
+			}
+		}
+
+		REX::INFO("[LootGlow] MGEF probe complete: nodesSeen={}, effectValuesSeen={}, targetHits={}", nodesSeen, effectValuesSeen, targetHits);
+	}
+
 
 	struct ItemValueResult
 	{
@@ -1095,11 +1379,58 @@ namespace LootGlow::GoldSelection
 		}
 	}
 
+	ItemValueResult TryReadAlchemyItemValue(RE::TESForm* a_form)
+	{
+#if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
+		if (!a_form) {
+			return {};
+		}
+
+		auto* potion = a_form->As<RE::AlchemyItem>();
+		if (!potion) {
+			return {};
+		}
+
+		// ALCH records do not inherit TESValueForm. Their exposed base/display
+		// value lives in AlchemyItemData::costOverride at AlchemyItem + 0x118.
+		// This fixes valuable potions being counted as unknown high-value items.
+		if (potion->data.costOverride > 0) {
+			return { true, static_cast<std::uint32_t>(potion->data.costOverride) };
+		}
+
+#if LOOTGLOW_HAS_MAGICITEM_HEADER
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* magicItem = dynamic_cast<RE::MagicItem*>(potion);
+			if (magicItem) {
+				const auto cost = magicItem->GetCost(nullptr);
+				if (cost > 0.0F) {
+					return { true, static_cast<std::uint32_t>(cost + 0.5F) };
+				}
+			}
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return {};
+		}
+#endif
+#endif
+#else
+		(void)a_form;
+#endif
+
+		return {};
+	}
+
 	ItemValueResult GetItemBaseGoldValue(RE::TESForm* a_form)
 	{
 		if (!a_form) {
 			return {};
 		}
+
+#if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
+		if (auto value = TryReadAlchemyItemValue(a_form); value.available) { return value; }
+#endif
 
 #if LOOTGLOW_HAS_TESOBJECTMISC_HEADER
 		if (auto value = TryReadValueAs<RE::TESObjectMISC>(a_form); value.available) { return value; }
@@ -1273,6 +1604,11 @@ namespace LootGlow::GoldSelection
 		return GetFormID(a_form) == g_settings.goldFormID;
 	}
 
+	bool IsExactLockpickForm(RE::TESForm* a_form)
+	{
+		return GetFormID(a_form) == g_settings.lockpickFormID;
+	}
+
 	std::int32_t NormalizeBaseContainerCount(std::int32_t a_count)
 	{
 		return a_count < 0 ? -a_count : a_count;
@@ -1320,6 +1656,7 @@ namespace LootGlow::GoldSelection
 		auto* changes = GetInventoryChanges(a_ref);
 
 		std::int32_t goldTotalCount = 0;
+		std::int32_t lockpickTotalCount = 0;
 		bool hasGold = false;
 		ContainerValueSummary valueSummary{};
 
@@ -1335,8 +1672,12 @@ namespace LootGlow::GoldSelection
 			const auto totalCount = EffectiveInventoryCount(baseCount, changeCount);
 
 			const bool isGold = IsExactGoldForm(obj->type);
+			const bool isLockpick = IsExactLockpickForm(obj->type);
 			if (totalCount > 0 && isGold) {
 				goldTotalCount += totalCount;
+			}
+			if (totalCount > 0 && isLockpick) {
+				lockpickTotalCount += totalCount;
 			}
 
 			if (g_settings.highValueMode && totalCount > 0 && (!isGold || g_settings.highValueIncludeGold)) {
@@ -1366,8 +1707,12 @@ namespace LootGlow::GoldSelection
 
 				const auto totalCount = EffectiveInventoryCountFromChangeOnly(change->count);
 				const bool isGold = IsExactGoldForm(change->object);
+				const bool isLockpick = IsExactLockpickForm(change->object);
 				if (totalCount > 0 && isGold) {
 					goldTotalCount += totalCount;
+				}
+				if (totalCount > 0 && isLockpick) {
+					lockpickTotalCount += totalCount;
 				}
 
 				if (g_settings.highValueMode && totalCount > 0 && (!isGold || g_settings.highValueIncludeGold)) {
@@ -1386,6 +1731,7 @@ namespace LootGlow::GoldSelection
 		}
 
 		hasGold = goldTotalCount > 0 && static_cast<std::uint32_t>(goldTotalCount) >= g_settings.goldCountThreshold;
+		const bool hasLockpicks = lockpickTotalCount > 0 && static_cast<std::uint32_t>(lockpickTotalCount) >= g_settings.lockpickCountThreshold;
 
 		if (hasGold) {
 			++g_counters.scanGoldPresent;
@@ -1393,18 +1739,20 @@ namespace LootGlow::GoldSelection
 			++g_counters.scanGoldAbsent;
 		}
 
-		const bool qualifiesByTotal = g_settings.highValueMode && valueSummary.knownFullValueTotal >= g_settings.highValueThreshold;
+		const bool qualifiesByTotal = g_settings.highValueMode && g_settings.highValueAggregateMode && valueSummary.knownFullValueTotal >= g_settings.highValueThreshold;
 		const bool qualifiesBySingle = g_settings.highValueMode && valueSummary.highestFullValueEach >= g_settings.highValueThreshold;
-		const bool hasHighValue = qualifiesByTotal || qualifiesBySingle;
+		const bool hasHighValue = qualifiesBySingle || qualifiesByTotal;
 
 		auto* entry = EnsureTrackedHoverContainer(a_ref);
 		if (!entry) {
-			if (hasGold && g_settings.debugLogging) {
-				REX::INFO("[LootGlow] {}: gold detected on untracked/non-container ref; skipping by design: ref={:016X}, goldTotalCount={}, goldThreshold={}",
+			if ((hasGold || hasLockpicks) && g_settings.debugLogging) {
+				REX::INFO("[LootGlow] {}: loot detected on untracked/non-container ref; skipping by design: ref={:016X}, goldTotalCount={}, goldThreshold={}, lockpickTotalCount={}, lockpickThreshold={}",
 					source,
 					reinterpret_cast<std::uintptr_t>(a_ref),
 					goldTotalCount,
-					g_settings.goldCountThreshold);
+					g_settings.goldCountThreshold,
+					lockpickTotalCount,
+					g_settings.lockpickCountThreshold);
 			}
 			return false;
 		}
@@ -1416,11 +1764,13 @@ namespace LootGlow::GoldSelection
 			entry->lastHasGold != hasGold ||
 			entry->lastGoldTotalCount != goldTotalCount ||
 			entry->lastHasHighValue != hasHighValue ||
+			entry->lastHasLockpicks != hasLockpicks ||
+			entry->lastLockpickTotalCount != lockpickTotalCount ||
 			entry->lastKnownFullValueTotal != valueSummary.knownFullValueTotal ||
 			entry->lastHighestFullValueEach != valueSummary.highestFullValueEach;
 
 		if (stateChanged && GoldSummaryLoggingEnabled()) {
-			REX::INFO("[LootGlow] {} classification: ref={:016X}, refForm={:08X}, baseForm={:08X}, goldTotalCount={}, goldThreshold={}, hasGold={}, highValue={}, knownFullValueTotal={}, highestFullValueEach={}, goldApplied={}, highValueApplied={}, name={}",
+			REX::INFO("[LootGlow] {} classification: ref={:016X}, refForm={:08X}, baseForm={:08X}, goldTotalCount={}, goldThreshold={}, hasGold={}, lockpickTotalCount={}, lockpickThreshold={}, hasLockpicks={}, highValue={}, knownFullValueTotal={}, highestFullValueEach={}, goldApplied={}, highValueApplied={}, lockpickApplied={}, name={}",
 				source,
 				reinterpret_cast<std::uintptr_t>(a_ref),
 				GetFormID(a_ref),
@@ -1428,15 +1778,19 @@ namespace LootGlow::GoldSelection
 				goldTotalCount,
 				g_settings.goldCountThreshold,
 				hasGold,
+				lockpickTotalCount,
+				g_settings.lockpickCountThreshold,
+				hasLockpicks,
 				hasHighValue,
 				valueSummary.knownFullValueTotal,
 				valueSummary.highestFullValueEach,
 				entry->gold.applied,
 				entry->highValue.applied,
+				entry->lockpick.applied,
 				entry->name[0] ? entry->name : "<unnamed>");
 		}
 		if (stateChanged && g_settings.highValueMode && HighValueSummaryLoggingEnabled()) {
-			REX::INFO("[LootGlow] {} high-value summary: ref={:016X}, refForm={:08X}, knownFullValueTotal={}, highestFullValueEach={}, threshold={}, hasHighValue={}, qualifiesByTotal={}, qualifiesBySingle={}, knownItems={}, unknownItems={}, includeGold={}",
+			REX::INFO("[LootGlow] {} high-value summary: ref={:016X}, refForm={:08X}, knownFullValueTotal={}, highestFullValueEach={}, threshold={}, hasHighValue={}, qualifiesByTotal={}, qualifiesBySingle={}, knownItems={}, unknownItems={}, includeGold={}, aggregateMode={}",
 				source,
 				reinterpret_cast<std::uintptr_t>(a_ref),
 				GetFormID(a_ref),
@@ -1448,14 +1802,31 @@ namespace LootGlow::GoldSelection
 				qualifiesBySingle,
 				valueSummary.knownItems,
 				valueSummary.unknownItems,
-				g_settings.highValueIncludeGold);
+				g_settings.highValueIncludeGold,
+				g_settings.highValueAggregateMode);
+		}
+
+		if (stateChanged && (LockpickEventLoggingEnabled() || LockpickSummaryLoggingEnabled())) {
+			REX::INFO("[LootGlow] {} lockpick classification: ref={:016X}, refForm={:08X}, baseForm={:08X}, lockpickTotalCount={}, lockpickThreshold={}, hasLockpicks={}, previousHasLockpicks={}, previousLockpickTotalCount={}, name={}",
+				source,
+				reinterpret_cast<std::uintptr_t>(a_ref),
+				GetFormID(a_ref),
+				entry->baseFormID,
+				lockpickTotalCount,
+				g_settings.lockpickCountThreshold,
+				hasLockpicks,
+				entry->lastHasLockpicks,
+				entry->lastLockpickTotalCount,
+				entry->name[0] ? entry->name : "<unnamed>");
 		}
 
 		if (stateChanged) {
 			entry->hoverSeen = true;
 			entry->lastHasGold = hasGold;
 			entry->lastHasHighValue = hasHighValue;
+			entry->lastHasLockpicks = hasLockpicks;
 			entry->lastGoldTotalCount = goldTotalCount;
+			entry->lastLockpickTotalCount = lockpickTotalCount;
 			entry->lastKnownFullValueTotal = valueSummary.knownFullValueTotal;
 			entry->lastHighestFullValueEach = valueSummary.highestFullValueEach;
 		}
@@ -1498,7 +1869,19 @@ namespace LootGlow::GoldSelection
 			changedGlow = ::RemoveHighValueGlowFromContainer(a_ref, entry, "high-value mode disabled") || changedGlow;
 		}
 
-		return changedGlow || hasGold || hasHighValue;
+		if (g_settings.lockpickMode) {
+			if (!hasLockpicks) {
+				if (entry->lockpick.applied) {
+					changedGlow = ::RemoveLockpickGlowFromContainer(a_ref, entry, "container no longer meets lockpick threshold") || changedGlow;
+				}
+			} else if (!entry->lockpick.applied || entry->lockpick.activeStacks < g_settings.lockpickGlowStackCount) {
+				changedGlow = ::ApplyLockpickGlowToContainer(a_ref, entry) || changedGlow;
+			}
+		} else if (entry->lockpick.applied) {
+			changedGlow = ::RemoveLockpickGlowFromContainer(a_ref, entry, "lockpick mode disabled") || changedGlow;
+		}
+
+		return changedGlow || hasGold || hasHighValue || hasLockpicks;
 	}
 
 	void ProcessDelayedRescans()
@@ -1564,6 +1947,7 @@ struct Hook_LoadGraphics_GoldSelection
 	{
 		auto result = LoadGraphicsFuncHook(a_ref);
 		++g_counters.loadGraphicsHits;
+		LootGlow::GoldSelection::MaybeRunMagicEffectShaderProbe("loadgraphics");
 		LootGlow::GoldSelection::ProcessDelayedRescans();
 
 		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
@@ -1623,18 +2007,34 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	LoadSettings();
 
 	REX::INFO("========================");
-	REX::INFO("LootGlow v0.2.0 V74C initialized");
+	REX::INFO("LootGlow v0.2.0 V76C high-value aggregate toggle initialized");
 	REX::INFO("Gold glow: threshold={} gold", g_settings.goldCountThreshold);
-	REX::INFO("High-value glow: enabled={}, threshold={} value", g_settings.highValueMode, g_settings.highValueThreshold);
-	if (g_settings.debugLogging || g_settings.goldLogging != 0 || g_settings.highValueLogging != 0) {
-		REX::INFO("Advanced settings: goldShader={:08X}, goldStacks={}, highValueShader={:08X}, highValueStacks={}, includeGold={}, goldLogging={}, highValueLogging={}, debugLogging={}",
+	REX::INFO("High-value glow: enabled={}, threshold={} value, aggregateMode={}", g_settings.highValueMode, g_settings.highValueThreshold, g_settings.highValueAggregateMode);
+	REX::INFO("Lockpick glow: enabled={}, formID={:08X}, threshold={}, shader={:08X}, stacks={}",
+		g_settings.lockpickMode,
+		g_settings.lockpickFormID,
+		g_settings.lockpickCountThreshold,
+		g_settings.lockpickShaderFormID,
+		g_settings.lockpickGlowStackCount);
+	if (g_settings.magicEffectProbeLogging) {
+		REX::INFO("Magic effect map probe: enabled=1");
+	}
+	if (g_settings.debugLogging || g_settings.goldLogging != 0 || g_settings.highValueLogging != 0 || g_settings.lockpickLogging != 0) {
+		REX::INFO("Advanced settings: goldShader={:08X}, goldStacks={}, highValueShader={:08X}, highValueStacks={}, includeGold={}, aggregateMode={}, goldLogging={}, highValueLogging={}, lockpickMode={}, lockpickFormID={:08X}, lockpickThreshold={}, lockpickShader={:08X}, lockpickStacks={}, lockpickLogging={}, debugLogging={}",
 			g_settings.winnerShaderFormID,
 			g_settings.glowStackCount,
 			g_settings.highValueShaderFormID,
 			g_settings.highValueGlowStackCount,
 			g_settings.highValueIncludeGold,
+			g_settings.highValueAggregateMode,
 			g_settings.goldLogging,
 			g_settings.highValueLogging,
+			g_settings.lockpickMode,
+			g_settings.lockpickFormID,
+			g_settings.lockpickCountThreshold,
+			g_settings.lockpickShaderFormID,
+			g_settings.lockpickGlowStackCount,
+			g_settings.lockpickLogging,
 			g_settings.debugLogging);
 	}
 	MaybeLogTrackingStats("startup", true);
