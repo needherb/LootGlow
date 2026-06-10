@@ -3,7 +3,7 @@ includes("lib/commonlibob64")
 
 -- set project constants
 set_project("LootGlow")
-set_version("0.2.1")
+set_version("0.3.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
