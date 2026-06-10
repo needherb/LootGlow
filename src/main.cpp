@@ -19,7 +19,6 @@
 // the runtime addresses and layout recovered from powerof3's Oblivion
 // Remastered Unread Books Glow DLL.
 #include "RE/T/TESFullName.h"
-#include "RE/E/EffectSetting.h"
 #if __has_include("RE/T/TESObjectMISC.h")
 #	include "RE/T/TESObjectMISC.h"
 #	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 1
@@ -116,7 +115,8 @@
 namespace
 {
 	// Runtime addresses/layouts mirror the proven MagicShaderHitEffect path used by
-	// the current stable LootGlow release.
+	// the current stable LootGlow release. Keep these narrow and documented because
+	// CommonLibOB64 does not currently expose this full effect path directly.
 	constexpr RE::TESFormID kDefaultWinnerShaderFormID = 0x000C793F;
 	constexpr RE::TESFormID kDefaultGoldFormID = 0x0000000F;
 	constexpr RE::TESFormID kDefaultLockpickFormID = 0x0000000A;
@@ -125,8 +125,7 @@ namespace
 	constexpr RE::TESFormID kDefaultHighValueShaderFormID = 0x000C793E;
 	constexpr std::uint32_t kDefaultHighValueGlowStackCount = 6;
 	constexpr std::uint32_t kDefaultHighValueThreshold = 250;
-	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;  // STRP / Soul Trap hit shader
-	constexpr RE::TESFormID kDefaultMagicEffectProbeMaxFormID = 0x00200000;
+	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;  // STRP / Soul Trap hit shader; chosen for readable lockpick glow
 	constexpr std::uint32_t kDefaultLockpickGlowStackCount = 4;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
 	constexpr std::uint32_t kMaxTrackedRefs = 8192;
@@ -135,6 +134,9 @@ namespace
 	constexpr std::uint64_t kStatsLogIntervalMs = 30000;
 	constexpr std::uint64_t kStatsMilestoneInterval = 25;
 
+	// Public INI stays intentionally small. Additional fields below are advanced
+	// compatibility/dev toggles and retain their safe built-in defaults unless a
+	// user manually adds them to LootGlow.ini.
 	struct Settings
 	{
 		RE::TESFormID winnerShaderFormID{ kDefaultWinnerShaderFormID };
@@ -147,8 +149,6 @@ namespace
 		RE::TESFormID lockpickShaderFormID{ kDefaultLockpickShaderFormID };
 		std::uint32_t lockpickGlowStackCount{ kDefaultLockpickGlowStackCount };
 		std::uint32_t lockpickLogging{ 0 };
-		bool magicEffectProbeLogging{ false };
-		RE::TESFormID magicEffectProbeMaxFormID{ kDefaultMagicEffectProbeMaxFormID };
 		std::uint32_t glowStackCount{ kDefaultGlowStackCount };
 		bool debugLogging{ false };
 
@@ -276,7 +276,6 @@ namespace
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
 	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
 	static std::uint64_t g_lastStatsDelayedProcessed{ 0 };
-	static bool g_magicEffectProbeDone{ false };
 
 	std::uint32_t ClampStackCount(std::uint32_t a_value)
 	{
@@ -328,11 +327,6 @@ namespace
 		g_settings.lockpickShaderFormID = ReadHexFormIDSetting(a_path, "LockpickShaderFormID", kDefaultLockpickShaderFormID);
 		g_settings.lockpickGlowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "LockpickStackCount", kDefaultLockpickGlowStackCount, a_path)));
 		g_settings.lockpickLogging = static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "LockpickLogging", 0, a_path));
-		g_settings.magicEffectProbeLogging = GetPrivateProfileIntA("LootGlow", "MagicEffectProbeLogging", 0, a_path) != 0;
-		g_settings.magicEffectProbeMaxFormID = ReadHexFormIDSetting(a_path, "MagicEffectProbeMaxFormID", kDefaultMagicEffectProbeMaxFormID);
-		if (g_settings.magicEffectProbeMaxFormID == 0) {
-			g_settings.magicEffectProbeMaxFormID = kDefaultMagicEffectProbeMaxFormID;
-		}
 		g_settings.glowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "StackCount", kDefaultGlowStackCount, a_path)));
 		g_settings.debugLogging = GetPrivateProfileIntA("LootGlow", "DebugLogging", 0, a_path) != 0;
 		g_settings.highValueMode = GetPrivateProfileIntA("LootGlow", "HighValueMode", 1, a_path) != 0;
@@ -343,7 +337,9 @@ namespace
 		g_settings.highValueShaderFormID = ReadHexFormIDSetting(a_path, "HighValueShaderFormID", kDefaultHighValueShaderFormID);
 		g_settings.highValueGlowStackCount = ClampStackCount(static_cast<std::uint32_t>(GetPrivateProfileIntA("LootGlow", "HighValueStackCount", kDefaultHighValueGlowStackCount, a_path)));
 
-		REX::INFO("LootGlow settings loaded from {}", a_path);
+		if (g_settings.debugLogging) {
+			REX::INFO("LootGlow settings loaded from {}", a_path);
+		}
 		return true;
 	}
 
@@ -416,7 +412,7 @@ namespace
 
 	void LoadSettings()
 	{
-			// Search multiple realistic locations instead of assuming the
+		// Search multiple realistic locations instead of assuming the
 		// process working directory or a single game-root shape.
 		if (TryLoadSettingsFromExeRelatedPaths()) {
 			return;
@@ -443,7 +439,6 @@ namespace
 	using EffectInitFn = bool (*)(void*);
 	using ProcessListsGetterFn = void* (*)();
 	using FinishMagicShaderHitEffectFn = void (*)(void*, RE::TESObjectREFR*, RE::TESEffectShader*);
-	using EffectSettingCollectionGetterFn = void* (*)();
 
 	bool LooksPointerish(std::uintptr_t a_value)
 	{
@@ -653,6 +648,28 @@ namespace
 
 		REL::Relocation<FinishMagicShaderHitEffectFn> fn{ REL::Offset{ 0x06741E60 } };  // FinishMagicShaderHitEffect / REL ID 0x6425F in po3 DLL
 		fn(processLists, a_ref, a_shader);
+	}
+
+	void FinishGlowStackEffects(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader, const GlowStackState& a_state, std::uint32_t a_fallbackStackCount)
+	{
+		if (!a_ref || !a_shader) {
+			return;
+		}
+
+		// ProcessLists::FinishMagicShaderHitEffect removes one matching hit effect per call
+		// on some shader paths. LootGlow may intentionally stack multiple copies of the
+		// same shader for visibility, so removals need to drain the whole category stack.
+		auto attempts = a_state.activeStacks > 0 ? a_state.activeStacks : a_fallbackStackCount;
+		if (attempts == 0) {
+			attempts = 1;
+		}
+		if (attempts > kMaxGlowStackCount) {
+			attempts = kMaxGlowStackCount;
+		}
+
+		for (std::uint32_t i = 0; i < attempts; ++i) {
+			FinishMagicShaderHitEffect(a_ref, a_shader);
+		}
 	}
 
 	TrackedRef* FindTrackedRef(std::uintptr_t a_ref)
@@ -873,7 +890,7 @@ namespace
 			return false;
 		}
 
-		FinishMagicShaderHitEffect(a_ref, a_shader);
+		FinishGlowStackEffects(a_ref, a_shader, a_state, 1);
 
 		const auto previousStacks = a_state.activeStacks;
 		a_state = GlowStackState{};
@@ -912,7 +929,7 @@ namespace
 			return false;
 		}
 
-		FinishMagicShaderHitEffect(a_ref, a_shader);
+		FinishGlowStackEffects(a_ref, a_shader, a_state, a_stackCount);
 
 		void* processLists = GetProcessLists();
 		if (!processLists) {
@@ -1052,9 +1069,26 @@ namespace
 		return ApplyGlowStack(a_ref, a_entry, a_entry->highValue, shader, g_settings.highValueShaderFormID, g_settings.highValueGlowStackCount, "high-value", HighValueEventLoggingEnabled());
 	}
 
-	bool RemoveLockpickGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason)
+	bool RemoveLockpickGlowFromContainer(RE::TESObjectREFR* a_ref, TrackedRef* a_entry, const char* a_reason, bool a_forceFinish = false)
 	{
 		auto* shader = ResolveLockpickShader();
+		if (a_forceFinish && a_ref && a_entry && shader && !a_entry->lockpick.applied) {
+			GlowStackState fallback{};
+			fallback.activeStacks = g_settings.lockpickGlowStackCount;
+			FinishGlowStackEffects(a_ref, shader, fallback, g_settings.lockpickGlowStackCount);
+			a_entry->lockpick = GlowStackState{};
+			a_entry->lastRemoveMs = NowMs();
+			if (LockpickEventLoggingEnabled()) {
+				REX::INFO("[LootGlow] lockpick glow safety cleanup: ref={:016X}, refForm={:08X}, baseForm={:08X}, reason={}, name={}",
+					a_entry->ref,
+					a_entry->refFormID,
+					a_entry->baseFormID,
+					a_reason ? a_reason : "<none>",
+					a_entry->name[0] ? a_entry->name : "<unnamed>");
+			}
+			return true;
+		}
+
 		return RemoveGlowStack(a_ref, a_entry, a_entry->lockpick, shader, g_settings.lockpickShaderFormID, "lockpick", a_reason, LockpickEventLoggingEnabled());
 	}
 
@@ -1142,209 +1176,6 @@ namespace LootGlow::GoldSelection
 	{
 		return a_form ? static_cast<std::uint32_t>(a_form->GetFormID()) : 0;
 	}
-
-	struct MagicEffectProbeTarget
-	{
-		char code[5];
-		bool found{ false };
-	};
-
-	bool EffectCodeEquals(const std::byte (&a_effectID)[4], const char* a_code)
-	{
-		return static_cast<char>(a_effectID[0]) == a_code[0] &&
-		       static_cast<char>(a_effectID[1]) == a_code[1] &&
-		       static_cast<char>(a_effectID[2]) == a_code[2] &&
-		       static_cast<char>(a_effectID[3]) == a_code[3];
-	}
-
-	void CopyEffectCode(char (&a_dst)[5], const std::byte (&a_effectID)[4])
-	{
-		a_dst[0] = static_cast<char>(a_effectID[0]);
-		a_dst[1] = static_cast<char>(a_effectID[1]);
-		a_dst[2] = static_cast<char>(a_effectID[2]);
-		a_dst[3] = static_cast<char>(a_effectID[3]);
-		a_dst[4] = '\0';
-	}
-
-	std::uint32_t PackEffectCode(const char* a_code)
-	{
-		return static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[0])) |
-		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[1])) << 8) |
-		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[2])) << 16) |
-		       (static_cast<std::uint32_t>(static_cast<unsigned char>(a_code[3])) << 24);
-	}
-
-	struct EffectSettingMapNode
-	{
-		EffectSettingMapNode* next;      // 00
-		std::uint32_t         key;       // 08 - packed effect code, e.g. FISH = 0x48534946
-		std::uint32_t         pad0C;     // 0C
-		RE::EffectSetting*    value;     // 10
-	};
-	static_assert(sizeof(EffectSettingMapNode) == 0x18);
-
-	struct EffectSettingMapLayout
-	{
-		void*                 vtable;       // 00
-		std::uint32_t         bucketCount;  // 08 - initialized to 0x25 by FUN_146887AC0
-		std::uint32_t         pad0C;        // 0C
-		EffectSettingMapNode** buckets;     // 10
-		std::uint64_t         itemCount;    // 18 - Ghidra writes low 32 bits as count
-	};
-	static_assert(sizeof(EffectSettingMapLayout) == 0x20);
-
-	void* GetEffectSettingCollection()
-	{
-		// FUN_146887AC0: lazy singleton getter for EffectSettingCollection / NiTMap<EffectID, EffectSetting*>.
-		REL::Relocation<EffectSettingCollectionGetterFn> fn{ REL::Offset{ 0x06887AC0 } };
-		return fn();
-	}
-
-	void LogMagicEffectProbeHit(const char* a_requestedCode, RE::EffectSetting* a_effect, std::uint32_t a_key, std::uint32_t a_bucket, std::uint32_t a_depth)
-	{
-		if (!a_effect) {
-			return;
-		}
-
-		auto* hitShader = a_effect->data.effectShader;
-		auto* enchantShader = a_effect->data.enchantEffect;
-		char actualCode[5]{};
-		CopyEffectCode(actualCode, a_effect->effectID);
-
-		REX::INFO("[LootGlow] MGEF probe hit: requested={} actual={} key={:08X} effectForm={:08X} ptr={:016X} hitShader={:08X} hitPtr={:016X} enchantShader={:08X} enchantPtr={:016X} baseCost={:.4f} school={} flags={:08X} bucket={} depth={}",
-			a_requestedCode ? a_requestedCode : "????",
-			actualCode,
-			a_key,
-			GetFormID(a_effect),
-			reinterpret_cast<std::uintptr_t>(a_effect),
-			GetFormID(hitShader),
-			reinterpret_cast<std::uintptr_t>(hitShader),
-			GetFormID(enchantShader),
-			reinterpret_cast<std::uintptr_t>(enchantShader),
-			a_effect->data.baseCost,
-			static_cast<std::int32_t>(a_effect->data.magicSchool),
-			a_effect->data.flags,
-			a_bucket,
-			a_depth);
-	}
-
-	void MaybeRunMagicEffectShaderProbe(const char* a_reason)
-	{
-		if (!g_settings.magicEffectProbeLogging || g_magicEffectProbeDone) {
-			return;
-		}
-
-		g_magicEffectProbeDone = true;
-
-		std::array<MagicEffectProbeTarget, 17> targets{{
-			// Known controls / already-tested candidates
-			{{ 'D', 'T', 'C', 'T', '\0' }, false}, // Detect Life
-			{{ 'F', 'I', 'S', 'H', '\0' }, false}, // Fire Shield
-			{{ 'F', 'R', 'S', 'H', '\0' }, false}, // Frost Shield
-			{{ 'L', 'I', 'S', 'H', '\0' }, false}, // Shock/Lightning Shield
-			{{ 'S', 'H', 'L', 'D', '\0' }, false}, // Shield
-
-			// Distinct visual candidates for lockpick glow
-			{{ 'S', 'T', 'R', 'P', '\0' }, false}, // Soul Trap
-			{{ 'S', 'A', 'B', 'S', '\0' }, false}, // Spell Absorption
-			{{ 'R', 'F', 'L', 'C', '\0' }, false}, // Reflect Spell
-			{{ 'R', 'E', 'D', 'G', '\0' }, false}, // Reflect Damage
-			{{ 'P', 'A', 'R', 'A', '\0' }, false}, // Paralyze
-			{{ 'S', 'L', 'N', 'C', '\0' }, false}, // Silence
-			{{ 'T', 'U', 'R', 'N', '\0' }, false}, // Turn Undead
-			{{ 'R', 'E', 'A', 'N', '\0' }, false}, // Reanimate
-
-			// Earlier interesting-but-likely-empty controls
-			{{ 'Z', 'L', 'I', 'C', '\0' }, false}, // Summon Lich
-			{{ 'D', 'U', 'M', 'Y', '\0' }, false}, // Mehrunes Dagon Custom Effect
-
-			// Extra color/contrast references
-			{{ 'F', 'I', 'D', 'G', '\0' }, false}, // Fire Damage
-			{{ 'S', 'H', 'D', 'G', '\0' }, false}, // Shock Damage
-		}};
-
-		REX::INFO("[LootGlow] MGEF probe starting: reason={}, method=EffectSettingCollection-map-walk",
-			a_reason ? a_reason : "unknown");
-
-		std::uint32_t nodesSeen = 0;
-		std::uint32_t effectValuesSeen = 0;
-		std::uint32_t targetHits = 0;
-
-#if defined(_MSC_VER)
-		__try {
-#endif
-			auto* rawMap = GetEffectSettingCollection();
-			auto* map = reinterpret_cast<EffectSettingMapLayout*>(rawMap);
-			if (!LooksPointerish(reinterpret_cast<std::uintptr_t>(map)) || !LooksPointerish(reinterpret_cast<std::uintptr_t>(map->buckets))) {
-				REX::INFO("[LootGlow] MGEF probe failed: invalid EffectSettingCollection map/buckets. map={:016X}",
-					reinterpret_cast<std::uintptr_t>(map));
-				return;
-			}
-
-			const auto bucketCount = map->bucketCount;
-			if (bucketCount == 0 || bucketCount > 4096) {
-				REX::INFO("[LootGlow] MGEF probe failed: suspicious bucketCount={} map={:016X}",
-					bucketCount,
-					reinterpret_cast<std::uintptr_t>(map));
-				return;
-			}
-
-			REX::INFO("[LootGlow] MGEF probe map: map={:016X} buckets={:016X} bucketCount={} itemCount={}",
-				reinterpret_cast<std::uintptr_t>(map),
-				reinterpret_cast<std::uintptr_t>(map->buckets),
-				bucketCount,
-				static_cast<std::uint32_t>(map->itemCount));
-
-			for (std::uint32_t bucket = 0; bucket < bucketCount; ++bucket) {
-				auto* node = map->buckets[bucket];
-				std::uint32_t depth = 0;
-				while (LooksPointerish(reinterpret_cast<std::uintptr_t>(node)) && depth < 1024) {
-					++nodesSeen;
-					auto* effect = node->value;
-					if (LooksPointerish(reinterpret_cast<std::uintptr_t>(effect))) {
-						++effectValuesSeen;
-						for (auto& target : targets) {
-							if (target.found) {
-								continue;
-							}
-
-							const auto packed = PackEffectCode(target.code);
-							if (node->key == packed || EffectCodeEquals(effect->effectID, target.code)) {
-								target.found = true;
-								++targetHits;
-								LogMagicEffectProbeHit(target.code, effect, node->key, bucket, depth);
-							}
-						}
-					}
-
-					if (targetHits == targets.size()) {
-						break;
-					}
-
-					node = node->next;
-					++depth;
-				}
-
-				if (targetHits == targets.size()) {
-					break;
-				}
-			}
-#if defined(_MSC_VER)
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			REX::INFO("[LootGlow] MGEF probe failed: exception while walking EffectSettingCollection map");
-			return;
-		}
-#endif
-
-		for (const auto& target : targets) {
-			if (!target.found) {
-				REX::INFO("[LootGlow] MGEF probe miss: code={} packed={:08X}", target.code, PackEffectCode(target.code));
-			}
-		}
-
-		REX::INFO("[LootGlow] MGEF probe complete: nodesSeen={}, effectValuesSeen={}, targetHits={}", nodesSeen, effectValuesSeen, targetHits);
-	}
-
 
 	struct ItemValueResult
 	{
@@ -1614,17 +1445,28 @@ namespace LootGlow::GoldSelection
 		return a_count < 0 ? -a_count : a_count;
 	}
 
-	std::int32_t EffectiveInventoryCount(std::int32_t a_baseCount, std::int32_t a_changeCount)
+	std::int32_t EffectiveInventoryCount(std::int32_t a_baseCount, std::int32_t a_changeCount, bool a_hasChange)
 	{
-		// Most container changes are baseCount + countDelta. During console-driven
-		// tests, added items can appear with a negative delta on some entries. Treat
-		// a negative delta larger than the base stack as an added stack, while still
-		// preserving the normal removal case, e.g. base 20 + delta -20 = 0.
-		if (a_changeCount < 0) {
-			const auto absDelta = -a_changeCount;
-			if (absDelta > a_baseCount) {
-				return a_baseCount + absDelta;
-			}
+		// Reconcile editor/base container stacks with runtime InventoryChanges. This
+		// is intentionally shared by gold, high-value loot, and lockpicks so all three
+		// categories agree about what is currently inside the container.
+		//
+		// Important discovered edge case: a world chest that spawned with lockpicks
+		// produced baseCount=2 and changeCount=0 after the player removed them.
+		// Treating that as base+0 kept the lockpick glow alive forever. Therefore,
+		// when a base item has a non-negative change entry, treat that entry as the
+		// current remaining stack count. Negative entries remain removal deltas.
+		if (!a_hasChange) {
+			return a_baseCount > 0 ? a_baseCount : 0;
+		}
+
+		if (a_changeCount >= 0) {
+			return a_changeCount;
+		}
+
+		const auto absDelta = -a_changeCount;
+		if (absDelta > a_baseCount) {
+			return a_baseCount + absDelta;
 		}
 
 		const auto total = a_baseCount + a_changeCount;
@@ -1669,7 +1511,7 @@ namespace LootGlow::GoldSelection
 			auto* change = FindItemChange(changes, obj->type);
 			const auto baseCount = NormalizeBaseContainerCount(obj->count);
 			const auto changeCount = change ? change->count : 0;
-			const auto totalCount = EffectiveInventoryCount(baseCount, changeCount);
+			const auto totalCount = EffectiveInventoryCount(baseCount, changeCount, change != nullptr);
 
 			const bool isGold = IsExactGoldForm(obj->type);
 			const bool isLockpick = IsExactLockpickForm(obj->type);
@@ -1739,6 +1581,9 @@ namespace LootGlow::GoldSelection
 			++g_counters.scanGoldAbsent;
 		}
 
+		// HighValueAggregateMode=1 keeps the original "valuable container overall"
+		// behavior. HighValueAggregateMode=0 requires at least one individual item to
+		// meet the threshold, avoiding glow from large piles of low-value clutter.
 		const bool qualifiesByTotal = g_settings.highValueMode && g_settings.highValueAggregateMode && valueSummary.knownFullValueTotal >= g_settings.highValueThreshold;
 		const bool qualifiesBySingle = g_settings.highValueMode && valueSummary.highestFullValueEach >= g_settings.highValueThreshold;
 		const bool hasHighValue = qualifiesBySingle || qualifiesByTotal;
@@ -1758,6 +1603,8 @@ namespace LootGlow::GoldSelection
 		}
 
 		entry->lastScanMs = NowMs();
+
+		const bool previousHasLockpicks = entry->hoverSeen && entry->lastHasLockpicks;
 
 		const bool stateChanged =
 			!entry->hoverSeen ||
@@ -1871,8 +1718,8 @@ namespace LootGlow::GoldSelection
 
 		if (g_settings.lockpickMode) {
 			if (!hasLockpicks) {
-				if (entry->lockpick.applied) {
-					changedGlow = ::RemoveLockpickGlowFromContainer(a_ref, entry, "container no longer meets lockpick threshold") || changedGlow;
+				if (entry->lockpick.applied || previousHasLockpicks) {
+					changedGlow = ::RemoveLockpickGlowFromContainer(a_ref, entry, "container no longer meets lockpick threshold", previousHasLockpicks) || changedGlow;
 				}
 			} else if (!entry->lockpick.applied || entry->lockpick.activeStacks < g_settings.lockpickGlowStackCount) {
 				changedGlow = ::ApplyLockpickGlowToContainer(a_ref, entry) || changedGlow;
@@ -1947,7 +1794,6 @@ struct Hook_LoadGraphics_GoldSelection
 	{
 		auto result = LoadGraphicsFuncHook(a_ref);
 		++g_counters.loadGraphicsHits;
-		LootGlow::GoldSelection::MaybeRunMagicEffectShaderProbe("loadgraphics");
 		LootGlow::GoldSelection::ProcessDelayedRescans();
 
 		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
@@ -2007,7 +1853,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	LoadSettings();
 
 	REX::INFO("========================");
-	REX::INFO("LootGlow v0.2.0 V76C high-value aggregate toggle initialized");
+	REX::INFO("LootGlow v0.3.0 V77B production initialized");
 	REX::INFO("Gold glow: threshold={} gold", g_settings.goldCountThreshold);
 	REX::INFO("High-value glow: enabled={}, threshold={} value, aggregateMode={}", g_settings.highValueMode, g_settings.highValueThreshold, g_settings.highValueAggregateMode);
 	REX::INFO("Lockpick glow: enabled={}, formID={:08X}, threshold={}, shader={:08X}, stacks={}",
@@ -2016,9 +1862,6 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 		g_settings.lockpickCountThreshold,
 		g_settings.lockpickShaderFormID,
 		g_settings.lockpickGlowStackCount);
-	if (g_settings.magicEffectProbeLogging) {
-		REX::INFO("Magic effect map probe: enabled=1");
-	}
 	if (g_settings.debugLogging || g_settings.goldLogging != 0 || g_settings.highValueLogging != 0 || g_settings.lockpickLogging != 0) {
 		REX::INFO("Advanced settings: goldShader={:08X}, goldStacks={}, highValueShader={:08X}, highValueStacks={}, includeGold={}, aggregateMode={}, goldLogging={}, highValueLogging={}, lockpickMode={}, lockpickFormID={:08X}, lockpickThreshold={}, lockpickShader={:08X}, lockpickStacks={}, lockpickLogging={}, debugLogging={}",
 			g_settings.winnerShaderFormID,
@@ -2037,7 +1880,9 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 			g_settings.lockpickLogging,
 			g_settings.debugLogging);
 	}
-	MaybeLogTrackingStats("startup", true);
+	if (g_settings.debugLogging) {
+		MaybeLogTrackingStats("startup", true);
+	}
 	REX::INFO("========================");
 	return true;
 }
