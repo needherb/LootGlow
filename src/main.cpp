@@ -1892,7 +1892,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 
 	LoadSettings();
 
-	REX::INFO("LootGlow v0.3.0 V77D production initialized");
+	REX::INFO("LootGlow v0.3.2 V77D production initialized");
 	REX::INFO("Gold glow: threshold={} gold", g_settings.goldCountThreshold);
 	REX::INFO("High-value glow: enabled={}, threshold={} value, aggregateMode={}", g_settings.highValueMode, g_settings.highValueThreshold, g_settings.highValueAggregateMode);
 	REX::INFO("Lockpick glow: enabled={}, formID={:08X}, threshold={}, shader={:08X}, stacks={}",
