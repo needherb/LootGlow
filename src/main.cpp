@@ -537,7 +537,7 @@ namespace
 
 	void* AllocateGameObject(std::uint64_t a_size)
 	{
-		REL::Relocation<AllocFn> fn{ REL::Offset{ 0x04702CB0 } };  // FUN_144702CB0 / allocator used by po3 path
+		REL::Relocation<AllocFn> fn{ REL::ID(303328) };  // Address Library 1.512.105.0: 144702CB0 / allocator used by po3 path
 		return fn(a_size);
 	}
 
@@ -548,7 +548,7 @@ namespace
 			return nullptr;
 		}
 
-		REL::Relocation<MagicShaderCtorFn> ctor{ REL::Offset{ 0x068AAE60 } };  // MagicShaderHitEffect ctor / REL ID 0x655A5 in po3 DLL
+		REL::Relocation<MagicShaderCtorFn> ctor{ REL::ID(415141) };  // Address Library 1.512.105.0: 1468AAE60 / MagicShaderHitEffect ctor
 		return ctor(mem, a_ref, a_shader, a_duration, 0xFFFFFFFFu);
 	}
 
@@ -569,7 +569,7 @@ namespace
 
 	void* GetProcessLists()
 	{
-		REL::Relocation<ProcessListsGetterFn> fn{ REL::Offset{ 0x0674B050 } };
+		REL::Relocation<ProcessListsGetterFn> fn{ REL::ID(410297) };  // Address Library 1.512.105.0: 14674B050
 		return fn();
 	}
 
@@ -646,7 +646,7 @@ namespace
 			return;
 		}
 
-		REL::Relocation<FinishMagicShaderHitEffectFn> fn{ REL::Offset{ 0x06741E60 } };  // FinishMagicShaderHitEffect / REL ID 0x6425F in po3 DLL
+		REL::Relocation<FinishMagicShaderHitEffectFn> fn{ REL::ID(410207) };  // Address Library 1.512.105.0: 146741E60 / FinishMagicShaderHitEffect
 		fn(processLists, a_ref, a_shader);
 	}
 
