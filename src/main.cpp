@@ -138,10 +138,10 @@ namespace
 	constexpr std::uint32_t kDefaultMediumTierThreshold = 100;
 	constexpr std::uint32_t kDefaultHighTierThreshold = 250;
 	constexpr std::uint32_t kDefaultInsaneTierThreshold = 500;
-	constexpr std::uint32_t kDefaultLowTierStackCount = 4;
-	constexpr std::uint32_t kDefaultMediumTierStackCount = 1;
-	constexpr std::uint32_t kDefaultHighTierStackCount = 1;
-	constexpr std::uint32_t kDefaultInsaneTierStackCount = 1;
+	constexpr std::uint32_t kDefaultLowTierStackCount = 8;
+	constexpr std::uint32_t kDefaultMediumTierStackCount = 8;
+	constexpr std::uint32_t kDefaultHighTierStackCount = 4;
+	constexpr std::uint32_t kDefaultInsaneTierStackCount = 16;
 	constexpr std::uint32_t kDefaultInsaneTierSecondaryStackCount = 1;
 	constexpr std::uint32_t kDefaultLockpickStackCount = 4;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
