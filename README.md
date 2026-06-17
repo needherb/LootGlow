@@ -1,42 +1,36 @@
 # LootGlow
 
-**LootGlow** is an OBSE64/CommonLibOB64 plugin for **Oblivion Remastered** that highlights loaded containers with worthwhile loot.
+LootGlow is an OBSE64 plugin for **The Elder Scrolls IV: Oblivion Remastered** that highlights loot containers based on what is inside them.
 
-LootGlow can highlight containers that contain:
-
-- enough gold to meet your configured gold threshold
-- valuable non-gold loot, including high-value unenchanted items and enchanted/generated items
-
-Gold and high-value loot use separate glow effects, so a container can show one glow or both at the same time. Loose gold in the world is intentionally ignored; LootGlow is designed for containers.
+The goal is simple: valuable containers should be easier to notice at a glance without opening every chest, coffin, barrel, or sack.
 
 ## Features
 
-- Automatically scans loaded containers.
-- Highlights containers that contain enough gold.
-- Highlights containers that contain valuable non-gold loot.
-- Supports enchanted/generated item value estimates.
-- Uses separate glow effects for gold and high-value loot.
-- Removes the appropriate glow after qualifying loot is removed.
-- Ignores loose gold by design.
-- Uses a simple INI file with only the main user-facing settings.
-- Uses quiet logging by default.
+- Highlights containers based on estimated loot value.
+- Supports four value tiers:
+  - **Low**
+  - **Medium**
+  - **High**
+  - **Insane**
+- The **Insane** tier uses a configurable accent shader by default for a stronger visual effect.
+- Highlights lockpick-only containers when no value tier is active.
+- Value tiers suppress lockpick-only glow, so a valuable container with lockpicks still uses the value-tier visual.
+- Supports total-value or highest-item-value detection.
+- Includes a defensive visual refresh option for containers whose graphics load or reload after the initial scan.
+- No engine tick refresh, background thread, or periodic shader refresh loop.
 
 ## Requirements
 
-- Oblivion Remastered
-- OBSE64
-- A mod manager or manual installation into the game's OBSE plugin folder
-
-OBSE64 is required and must be installed separately. LootGlow does not redistribute OBSE64.
+- **Oblivion Remastered**
+- **OBSE64**
+- **Address Library**
 
 ## Installation
 
-Install the release package so that `LootGlow.dll` and `LootGlow.ini` end up in the OBSE Plugins folder used by your Oblivion Remastered installation.
-
-Typical manual install path:
+Install with your preferred mod manager, or install manually by placing the files in:
 
 ```text
-OblivionRemastered\Binaries\Win64\OBSE\Plugins\
+Data/OBSE/Plugins/
 ```
 
 The folder should contain:
@@ -46,143 +40,106 @@ LootGlow.dll
 LootGlow.ini
 ```
 
-For example:
-
-```text
-OblivionRemastered\Binaries\Win64\OBSE\Plugins\LootGlow.dll
-OblivionRemastered\Binaries\Win64\OBSE\Plugins\LootGlow.ini
-```
-
-If using a mod manager, package or install the mod so that the same files are placed under the game's `OBSE\Plugins` folder.
-
 ## Configuration
 
-LootGlow uses `LootGlow.ini` if present. If the INI is missing, built-in defaults are used.
-
-Default configuration:
+LootGlow works out of the box with the included configuration.
 
 ```ini
 [LootGlow]
 
-; Containers glow when they contain this much gold or more.
-GoldCountThreshold=100
+LowTierThreshold=25
+LowTierShaderFormID=000C7939
 
-; Set to 0 to disable glow for valuable non-gold loot.
-HighValueMode=1
+MediumTierThreshold=100
+MediumTierShaderFormID=000C793E
 
-; Containers glow when they contain loot worth this much or more.
-HighValueThreshold=250
+HighTierThreshold=250
+HighTierShaderFormID=0008B95F
+
+InsaneTierThreshold=500
+InsaneTierShaderFormID=000C793F
+
+LockpickMode=1
+LockpickShaderFormID=0014A0A2
+
+; Set to 0 to disable the Insane tier accent shader.
+InsaneTierSecondaryMode=1
+InsaneTierSecondaryShaderFormID=0018B576
+
+; 1 = use total estimated container value
+; 0 = use highest single item/stack value
+AggregateMode=1
+
+; 0 = disabled
+; 1 = defensive refresh when container graphics load/reload
+VisualRefreshMode=1
 ```
 
-### Settings
+### Value tiers
 
-#### `GoldCountThreshold`
+LootGlow chooses the highest matching tier.
 
-The minimum amount of gold a container must contain before the gold glow is applied.
+For example, with the default settings:
 
-Default:
+- Containers worth **25+ gold** use the Low tier.
+- Containers worth **100+ gold** use the Medium tier.
+- Containers worth **250+ gold** use the High tier.
+- Containers worth **500+ gold** use the Insane tier.
+
+The Insane tier can also apply a secondary accent shader. This is enabled by default and can be disabled with:
 
 ```ini
-GoldCountThreshold=100
+InsaneTierSecondaryMode=0
 ```
 
-Examples:
+### AggregateMode
 
 ```ini
-; Any gold-containing container glows.
-GoldCountThreshold=1
-
-; Only containers with 100 or more gold glow.
-GoldCountThreshold=100
-
-; Only containers with 500 or more gold glow.
-GoldCountThreshold=500
+AggregateMode=1
 ```
 
-#### `HighValueMode`
-
-Enables or disables the high-value loot glow.
-
-Default:
+Uses the estimated total value of the container.
 
 ```ini
-HighValueMode=1
+AggregateMode=0
 ```
 
-Set to `0` if you only want the gold glow:
+Uses the highest estimated value of a single item or stack in the container.
+
+### LockpickMode
 
 ```ini
-HighValueMode=0
+LockpickMode=1
 ```
 
-#### `HighValueThreshold`
+Enables lockpick-only glow.
 
-The minimum estimated value required before a container receives the high-value loot glow.
+If a container qualifies for any value tier, the value tier wins and lockpick-only glow is suppressed.
 
-Default:
+### VisualRefreshMode
 
 ```ini
-HighValueThreshold=250
+VisualRefreshMode=1
 ```
 
-LootGlow estimates high-value loot using item value information from the game. Enchanted/generated items receive an additional enchantment-based value estimate so that valuable enchanted loot is not treated like a cheap base item.
+Enables a defensive refresh when container graphics load or reload. This helps restore visuals in cases where the game loads a container after LootGlow has already scanned it.
 
-Examples:
 
-```ini
-; More sensitive high-value glow.
-HighValueThreshold=100
+## Compatibility Notes
 
-; Default behavior.
-HighValueThreshold=250
+LootGlow only adds visual shader effects to detected containers. It does not change leveled lists, container contents, item values, or loot generation.
 
-; Only very valuable loot containers glow.
-HighValueThreshold=1000
-```
+LootGlow hooks the container graphics/loading path and tracks loaded container references. When a container is loaded, LootGlow checks its inventory for qualifying loot.
+
+If another mod changes container contents, LootGlow should evaluate the container based on what the game reports at runtime.
+
+However, compatibility with other mods that deeply alter the same container/menu or shader-effect paths is not guaranteed.
 
 ## Advanced Settings
 
 The default INI intentionally exposes only the most useful settings.
 
 LootGlow also supports additional advanced options for shader tuning and troubleshooting, but they are hidden from the default INI to keep installation simple. Most users should not need to change them.
-
-## How It Works
-
-LootGlow hooks the container graphics/loading path and tracks loaded container references. When a container is loaded, LootGlow checks its inventory for qualifying loot.
-
-If the container contains enough gold, LootGlow applies the gold glow. If the container contains valuable non-gold loot, LootGlow applies the high-value glow. These glow states are tracked separately, so removing one type of loot should remove only the matching glow.
-
-LootGlow also hooks the target/mini-menu information path as a correction path. This allows the plugin to notice when a highlighted container's contents change after it has already been scanned. If qualifying loot is removed, the matching glow is finished and allowed to dissipate.
-
-## Limitations
-
-- Containers are scanned when their graphics load.
-- Inventory changes are corrected when the container is targeted/opened through the game's normal interaction path.
-- Loose gold is intentionally ignored; LootGlow is designed to highlight containers, not individual gold piles.
-- High-value detection is an estimate intended to match the practical in-game value of loot closely enough for container highlighting.
-- Compatibility with other mods that deeply alter the same container/menu or shader-effect paths is not guaranteed.
-
-## Logging
-
-LootGlow writes a small startup log entry showing the loaded version and main configuration.
-
-By default, routine container detection is not logged. This keeps logs small during normal gameplay.
-
-Advanced logging settings are supported for troubleshooting, but they are not included in the default INI.
-
-## Known Good Defaults
-
-The `v0.2.0` baseline is designed around these settings:
-
-```ini
-[LootGlow]
-
-GoldCountThreshold=100
-HighValueMode=1
-HighValueThreshold=250
-```
-
-These defaults highlight containers with meaningful gold or valuable loot while ignoring very small gold amounts and low-value clutter.
 
 ## Building From Source
 
@@ -253,74 +210,3 @@ LootGlow source code is released under the GNU General Public License v3.0.
 See `LICENSE` for the full license text.
 
 See `docs/THIRD_PARTY_NOTICES.md` for third-party credits, permissions notes, and licensing notes.
-
-## Version History
-
-### v0.2.0
-
-- Adds high-value loot detection for containers.
-- Adds a separate high-value loot glow.
-- Supports enchanted/generated item value estimates.
-- Adds configurable gold threshold with `GoldCountThreshold`.
-- Simplifies the default INI to the main user-facing settings.
-- Keeps gold and high-value glow states independent.
-- Reduces default log verbosity.
-- Preserves automatic scanning, delayed rescans, and glow removal after looting.
-
-### v0.1.0
-
-- Initial public baseline.
-- Automatically highlights loaded containers that contain gold.
-- Removes glow after gold is looted.
-- Adds configurable gold form ID, shader form ID, stack count, and debug logging.
-- Uses quiet logging by default.
-
-## Troubleshooting
-
-### The mod does not appear to load
-
-- Confirm OBSE64 is installed and working.
-- Confirm `LootGlow.dll` is in the correct `OBSE\Plugins` folder.
-- Check the plugin log for:
-
-```text
-LootGlow v0.2.0.0
-```
-
-### No containers are glowing
-
-- Confirm the container actually has enough gold or high-value loot.
-- Lower `GoldCountThreshold` if you want smaller gold amounts to glow.
-- Lower `HighValueThreshold` if you want more valuable-loot containers to glow.
-- Confirm `HighValueMode=1` if you want high-value non-gold loot highlighting.
-
-### Too many containers are glowing
-
-- Raise `GoldCountThreshold` to require more gold.
-- Raise `HighValueThreshold` to require more valuable loot.
-- Set `HighValueMode=0` if you only want gold-based highlighting.
-
-### I only want gold containers to glow
-
-Set:
-
-```ini
-HighValueMode=0
-```
-
-### I want any gold amount to glow
-
-Set:
-
-```ini
-GoldCountThreshold=1
-```
-
-## Uninstall
-
-Remove these files from the OBSE Plugins folder:
-
-```text
-LootGlow.dll
-LootGlow.ini
-```
