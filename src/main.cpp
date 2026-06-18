@@ -8,9 +8,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string_view>
-#include <type_traits>
-#include <utility>
 
 #include <Windows.h>
 
@@ -110,16 +109,18 @@
 
 namespace
 {
-	// v0.4.0 release: four-tier loot highlighting with configurable Insane secondary shader.
+	// v0.4.1O: four value tiers plus one special Unique-item shader category.
 	//
 	// This file intentionally drops the old independent gold/high-value/lockpick
 	// visual state machine. A scan computes one desired visual plan, then all owned
-	// visuals are rebuilt only when that plan changes. The value tier remains
-	// exclusive. In this cleanup build, lockpick glow is standalone-only because
-	// STRP does not coexist reliably with the value-tier shaders in v0.4.0.
+	// visuals are rebuilt only when that plan changes. Unique is a special
+	// hand-authored item category and takes priority over monetary value tiers.
+	// Lockpick glow remains standalone-only because STRP does not coexist
+	// reliably with the value-tier shaders in v0.4.0C tests.
 	enum class LootTier : std::uint8_t
 	{
 		None = 0,
+		Unique,
 		Low,
 		Medium,
 		High,
@@ -133,16 +134,20 @@ namespace
 	constexpr RE::TESFormID kDefaultHighTierShaderFormID = 0x0008B95F;     // Blue high-tier default
 	constexpr RE::TESFormID kDefaultInsaneTierShaderFormID = 0x000C793F;   // Red/pink + gold primary insane-tier default
 	constexpr RE::TESFormID kDefaultInsaneTierSecondaryShaderFormID = 0x0018B576;  // Default extra Insane accent shader
+	constexpr RE::TESFormID kDefaultUniqueItemShaderFormID = 0x000852FE;  // Unique/artifact primary shader default
+	constexpr RE::TESFormID kDefaultUniqueItemSecondaryShaderFormID = 0x0018B579;  // Unique/artifact secondary accent shader default
 	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;    // STRP / purple Soul Trap hit effect
 	constexpr std::uint32_t kDefaultLowTierThreshold = 25;
 	constexpr std::uint32_t kDefaultMediumTierThreshold = 100;
 	constexpr std::uint32_t kDefaultHighTierThreshold = 250;
 	constexpr std::uint32_t kDefaultInsaneTierThreshold = 500;
-	constexpr std::uint32_t kDefaultLowTierStackCount = 8;
+	constexpr std::uint32_t kDefaultLowTierStackCount = 4;
 	constexpr std::uint32_t kDefaultMediumTierStackCount = 8;
 	constexpr std::uint32_t kDefaultHighTierStackCount = 4;
 	constexpr std::uint32_t kDefaultInsaneTierStackCount = 16;
-	constexpr std::uint32_t kDefaultInsaneTierSecondaryStackCount = 1;
+	constexpr std::uint32_t kDefaultInsaneTierSecondaryStackCount = 4;
+	constexpr std::uint32_t kDefaultUniqueItemStackCount = 16;
+	constexpr std::uint32_t kDefaultUniqueItemSecondaryStackCount = 16;
 	constexpr std::uint32_t kDefaultLockpickStackCount = 4;
 	constexpr std::uint32_t kMaxGlowStackCount = 16;
 	constexpr std::uint32_t kMaxTrackedRefs = 8192;
@@ -162,11 +167,19 @@ namespace
 		RE::TESFormID goldFormID{ kDefaultGoldFormID };
 		bool valueAggregateMode{ true };
 		bool debugLogging{ false };
+		bool debugItemValues{ false };
 		bool visualRefreshMode{ true };
 		bool lockpickMode{ true };
 		RE::TESFormID lockpickFormID{ kDefaultLockpickFormID };
 		RE::TESFormID lockpickShaderFormID{ kDefaultLockpickShaderFormID };
 		std::uint32_t lockpickStackCount{ kDefaultLockpickStackCount };
+
+		bool uniqueItemMode{ true };
+		RE::TESFormID uniqueItemShaderFormID{ kDefaultUniqueItemShaderFormID };
+		std::uint32_t uniqueItemStackCount{ kDefaultUniqueItemStackCount };
+		bool uniqueItemSecondaryEnabled{ true };
+		RE::TESFormID uniqueItemSecondaryShaderFormID{ kDefaultUniqueItemSecondaryShaderFormID };
+		std::uint32_t uniqueItemSecondaryStackCount{ kDefaultUniqueItemSecondaryStackCount };
 
 		bool lowTierEnabled{ true };
 		std::uint32_t lowTierThreshold{ kDefaultLowTierThreshold };
@@ -215,7 +228,7 @@ namespace
 		std::uint32_t refFormID{ 0 };
 		std::uint32_t baseFormID{ 0 };
 		GlowStackState valueGlow{};
-		GlowStackState insaneSecondaryGlow{};
+		GlowStackState secondaryGlow{};
 		GlowStackState lockpickGlow{};
 		LootTier appliedTier{ LootTier::None };
 		bool appliedLockpickGlow{ false };
@@ -235,9 +248,10 @@ namespace
 	{
 		std::uint64_t loadGraphicsHits{ 0 };
 		std::uint64_t containerLoadHits{ 0 };
-		std::uint64_t uniqueContainers{ 0 };
+		std::uint64_t trackedContainers{ 0 };
 		std::uint64_t scanCalls{ 0 };
 		std::uint64_t tierNone{ 0 };
+		std::uint64_t tierUnique{ 0 };
 		std::uint64_t tierLow{ 0 };
 		std::uint64_t tierMedium{ 0 };
 		std::uint64_t tierHigh{ 0 };
@@ -265,15 +279,19 @@ namespace
 	static RE::TESEffectShader* g_highTierShader{ nullptr };
 	static RE::TESEffectShader* g_insaneTierShader{ nullptr };
 	static RE::TESEffectShader* g_insaneTierSecondaryShader{ nullptr };
+	static RE::TESEffectShader* g_uniqueItemShader{ nullptr };
+	static RE::TESEffectShader* g_uniqueItemSecondaryShader{ nullptr };
 	static RE::TESEffectShader* g_lockpickShader{ nullptr };
 	static std::uint64_t g_lastStatsLogMs{ 0 };
-	static std::uint64_t g_lastStatsUniqueContainers{ 0 };
+	static std::uint64_t g_lastStatsTrackedContainers{ 0 };
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
 	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
 
 	const char* TierName(LootTier a_tier)
 	{
 		switch (a_tier) {
+		case LootTier::Unique:
+			return "Unique";
 		case LootTier::Low:
 			return "Low";
 		case LootTier::Medium:
@@ -324,12 +342,20 @@ namespace
 		const auto aggregateModeDefault = GetPrivateProfileIntA("LootGlow", "ValueAggregateMode", GetPrivateProfileIntA("LootGlow", "HighValueAggregateMode", 1, a_path), a_path);
 		g_settings.valueAggregateMode = GetPrivateProfileIntA("LootGlow", "AggregateMode", aggregateModeDefault, a_path) != 0;
 		g_settings.debugLogging = GetPrivateProfileIntA("LootGlow", "DebugLogging", 0, a_path) != 0;
+		g_settings.debugItemValues = GetPrivateProfileIntA("LootGlow", "DebugItemValues", 0, a_path) != 0;
 		g_settings.visualRefreshMode = GetPrivateProfileIntA("LootGlow", "VisualRefreshMode", 1, a_path) != 0;
 
-		g_settings.lockpickMode = GetPrivateProfileIntA("LootGlow", "LockpickMode", 0, a_path) != 0;
+		g_settings.lockpickMode = GetPrivateProfileIntA("LootGlow", "LockpickMode", 1, a_path) != 0;
 		g_settings.lockpickFormID = ReadHexFormIDSetting(a_path, "LockpickFormID", kDefaultLockpickFormID);
 		g_settings.lockpickShaderFormID = ReadHexFormIDSetting(a_path, "LockpickShaderFormID", kDefaultLockpickShaderFormID);
 		g_settings.lockpickStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "LockpickStackCount", kDefaultLockpickStackCount));
+
+		g_settings.uniqueItemMode = GetPrivateProfileIntA("LootGlow", "UniqueItemMode", 1, a_path) != 0;
+		g_settings.uniqueItemShaderFormID = ReadHexFormIDSetting(a_path, "UniqueItemShaderFormID", kDefaultUniqueItemShaderFormID);
+		g_settings.uniqueItemStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "UniqueItemStackCount", kDefaultUniqueItemStackCount));
+		g_settings.uniqueItemSecondaryEnabled = GetPrivateProfileIntA("LootGlow", "UniqueItemSecondaryMode", 1, a_path) != 0;
+		g_settings.uniqueItemSecondaryShaderFormID = ReadHexFormIDSetting(a_path, "UniqueItemSecondaryShaderFormID", kDefaultUniqueItemSecondaryShaderFormID);
+		g_settings.uniqueItemSecondaryStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "UniqueItemSecondaryStackCount", kDefaultUniqueItemSecondaryStackCount));
 
 		g_settings.lowTierEnabled = GetPrivateProfileIntA("LootGlow", "LowTierMode", 1, a_path) != 0;
 		g_settings.lowTierThreshold = ReadPositiveIntSetting(a_path, "LowTierThreshold", kDefaultLowTierThreshold);
@@ -473,6 +499,17 @@ namespace
 	RE::TESEffectShader* ResolveTierShader(LootTier a_tier)
 	{
 		switch (a_tier) {
+		case LootTier::Unique:
+			if (!g_uniqueItemShader) {
+				g_uniqueItemShader = RE::TESForm::LookupByID<RE::TESEffectShader>(g_settings.uniqueItemShaderFormID);
+				if (!g_uniqueItemShader) {
+					++g_counters.shaderResolveFailures;
+					REX::INFO("LootGlow Unique item shader lookup failed/not ready: formID={:08X}", g_settings.uniqueItemShaderFormID);
+				} else if (g_settings.debugLogging) {
+					REX::INFO("LootGlow Unique item shader resolved: ptr={:016X}, formID={:08X}", reinterpret_cast<std::uintptr_t>(g_uniqueItemShader), g_settings.uniqueItemShaderFormID);
+				}
+			}
+			return g_uniqueItemShader;
 		case LootTier::Low:
 			if (!g_lowTierShader) {
 				g_lowTierShader = RE::TESForm::LookupByID<RE::TESEffectShader>(g_settings.lowTierShaderFormID);
@@ -540,6 +577,24 @@ namespace
 		return g_insaneTierSecondaryShader;
 	}
 
+	RE::TESEffectShader* ResolveUniqueItemSecondaryShader()
+	{
+		if (!g_settings.uniqueItemSecondaryEnabled || g_settings.uniqueItemSecondaryShaderFormID == 0 || g_settings.uniqueItemSecondaryStackCount == 0) {
+			return nullptr;
+		}
+
+		if (!g_uniqueItemSecondaryShader) {
+			g_uniqueItemSecondaryShader = RE::TESForm::LookupByID<RE::TESEffectShader>(g_settings.uniqueItemSecondaryShaderFormID);
+			if (!g_uniqueItemSecondaryShader) {
+				++g_counters.shaderResolveFailures;
+				REX::INFO("LootGlow Unique secondary shader lookup failed/not ready: formID={:08X}", g_settings.uniqueItemSecondaryShaderFormID);
+			} else if (g_settings.debugLogging) {
+				REX::INFO("LootGlow Unique secondary shader resolved: ptr={:016X}, formID={:08X}", reinterpret_cast<std::uintptr_t>(g_uniqueItemSecondaryShader), g_settings.uniqueItemSecondaryShaderFormID);
+			}
+		}
+		return g_uniqueItemSecondaryShader;
+	}
+
 	RE::TESEffectShader* ResolveLockpickShader()
 	{
 		if (!g_lockpickShader) {
@@ -556,7 +611,8 @@ namespace
 
 	RE::TESFormID TierShaderFormID(LootTier a_tier)
 	{
-		return a_tier == LootTier::Low ? g_settings.lowTierShaderFormID :
+		return a_tier == LootTier::Unique ? g_settings.uniqueItemShaderFormID :
+		       a_tier == LootTier::Low ? g_settings.lowTierShaderFormID :
 		       a_tier == LootTier::Medium ? g_settings.mediumTierShaderFormID :
 		       a_tier == LootTier::High ? g_settings.highTierShaderFormID :
 		       a_tier == LootTier::Insane ? g_settings.insaneTierShaderFormID : 0;
@@ -564,10 +620,35 @@ namespace
 
 	std::uint32_t TierStackCount(LootTier a_tier)
 	{
-		return a_tier == LootTier::Low ? g_settings.lowTierStackCount :
+		return a_tier == LootTier::Unique ? g_settings.uniqueItemStackCount :
+		       a_tier == LootTier::Low ? g_settings.lowTierStackCount :
 		       a_tier == LootTier::Medium ? g_settings.mediumTierStackCount :
 		       a_tier == LootTier::High ? g_settings.highTierStackCount :
 		       a_tier == LootTier::Insane ? g_settings.insaneTierStackCount : 0;
+	}
+
+	bool TierSecondaryEnabled(LootTier a_tier)
+	{
+		return a_tier == LootTier::Unique ? g_settings.uniqueItemSecondaryEnabled :
+		       a_tier == LootTier::Insane ? g_settings.insaneTierSecondaryEnabled : false;
+	}
+
+	RE::TESFormID TierSecondaryShaderFormID(LootTier a_tier)
+	{
+		return a_tier == LootTier::Unique ? g_settings.uniqueItemSecondaryShaderFormID :
+		       a_tier == LootTier::Insane ? g_settings.insaneTierSecondaryShaderFormID : 0;
+	}
+
+	std::uint32_t TierSecondaryStackCount(LootTier a_tier)
+	{
+		return a_tier == LootTier::Unique ? g_settings.uniqueItemSecondaryStackCount :
+		       a_tier == LootTier::Insane ? g_settings.insaneTierSecondaryStackCount : 0;
+	}
+
+	RE::TESEffectShader* ResolveTierSecondaryShader(LootTier a_tier)
+	{
+		return a_tier == LootTier::Unique ? ResolveUniqueItemSecondaryShader() :
+		       a_tier == LootTier::Insane ? ResolveInsaneTierSecondaryShader() : nullptr;
 	}
 
 	LootTier SelectTier(std::uint64_t a_knownValueTotal, std::uint32_t a_highestValueCandidate)
@@ -754,7 +835,7 @@ namespace
 
 		const auto now = NowMs();
 		const bool milestone =
-			MilestoneReached(g_counters.uniqueContainers, g_lastStatsUniqueContainers) ||
+			MilestoneReached(g_counters.trackedContainers, g_lastStatsTrackedContainers) ||
 			MilestoneReached(g_counters.applySuccesses, g_lastStatsApplySuccesses) ||
 			MilestoneReached(g_counters.removeSuccesses, g_lastStatsRemoveSuccesses);
 
@@ -763,7 +844,7 @@ namespace
 		}
 
 		g_lastStatsLogMs = now;
-		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, scans={}, tiers={}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, removes={}, skipped={}, refreshes={}, shaderFails={}, tableFull={}, reuseResets={}",
+		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, scans={}, tiers={}/{}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, removes={}, skipped={}, refreshes={}, shaderFails={}, tableFull={}, reuseResets={}",
 			a_reason ? a_reason : "stats",
 			CountTrackedRefs(),
 			kMaxTrackedRefs,
@@ -772,6 +853,7 @@ namespace
 			g_counters.containerLoadHits,
 			g_counters.scanCalls,
 			g_counters.tierNone,
+			g_counters.tierUnique,
 			g_counters.tierLow,
 			g_counters.tierMedium,
 			g_counters.tierHigh,
@@ -818,7 +900,7 @@ namespace
 			entry.refFormID = currentRefFormID;
 			entry.baseFormID = currentBaseFormID;
 			CopyName(entry.name, a_name);
-			++g_counters.uniqueContainers;
+			++g_counters.trackedContainers;
 			MaybeLogStats("track-new");
 			return &entry;
 		}
@@ -843,15 +925,15 @@ namespace
 		++g_counters.removeAttempts;
 		const auto oldTier = a_entry.appliedTier;
 		const auto oldStacks = a_entry.valueGlow.activeStacks;
-		const auto oldSecondaryStacks = a_entry.insaneSecondaryGlow.activeStacks;
+		const auto oldSecondaryStacks = a_entry.secondaryGlow.activeStacks;
 		FinishTrackedStack(a_ref, shader, a_entry.valueGlow);
-		if (oldTier == LootTier::Insane && a_entry.insaneSecondaryGlow.applied) {
-			if (auto* secondaryShader = ResolveInsaneTierSecondaryShader()) {
-				FinishTrackedStack(a_ref, secondaryShader, a_entry.insaneSecondaryGlow);
+		if (a_entry.secondaryGlow.applied) {
+			if (auto* secondaryShader = ResolveTierSecondaryShader(oldTier)) {
+				FinishTrackedStack(a_ref, secondaryShader, a_entry.secondaryGlow);
 			}
 		}
 		a_entry.valueGlow = GlowStackState{};
-		a_entry.insaneSecondaryGlow = GlowStackState{};
+		a_entry.secondaryGlow = GlowStackState{};
 		a_entry.appliedTier = LootTier::None;
 		++g_counters.removeSuccesses;
 
@@ -892,7 +974,7 @@ namespace
 		std::uint32_t stackSuccesses = 0;
 		std::uint32_t secondaryStackSuccesses = 0;
 		a_entry.valueGlow = GlowStackState{};
-		a_entry.insaneSecondaryGlow = GlowStackState{};
+		a_entry.secondaryGlow = GlowStackState{};
 
 		++g_counters.applyAttempts;
 		for (std::uint32_t stackIndex = 0; stackIndex < stackCount; ++stackIndex) {
@@ -909,12 +991,13 @@ namespace
 			return false;
 		}
 
-		if (a_tier == LootTier::Insane) {
-			if (auto* secondaryShader = ResolveInsaneTierSecondaryShader()) {
-				for (std::uint32_t stackIndex = 0; stackIndex < g_settings.insaneTierSecondaryStackCount; ++stackIndex) {
+		if (TierSecondaryEnabled(a_tier)) {
+			if (auto* secondaryShader = ResolveTierSecondaryShader(a_tier)) {
+				const auto secondaryStackCount = TierSecondaryStackCount(a_tier);
+				for (std::uint32_t stackIndex = 0; stackIndex < secondaryStackCount; ++stackIndex) {
 					void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
 					if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-						REX::INFO("LootGlow Insane secondary tier stack {}/{} failed for ref={:016X}", stackIndex + 1, g_settings.insaneTierSecondaryStackCount, a_entry.ref);
+						REX::INFO("LootGlow {} secondary tier stack {}/{} failed for ref={:016X}", TierName(a_tier), stackIndex + 1, secondaryStackCount, a_entry.ref);
 						continue;
 					}
 					++secondaryStackSuccesses;
@@ -924,8 +1007,8 @@ namespace
 
 		a_entry.valueGlow.applied = true;
 		a_entry.valueGlow.activeStacks = stackSuccesses;
-		a_entry.insaneSecondaryGlow.applied = secondaryStackSuccesses > 0;
-		a_entry.insaneSecondaryGlow.activeStacks = secondaryStackSuccesses;
+		a_entry.secondaryGlow.applied = secondaryStackSuccesses > 0;
+		a_entry.secondaryGlow.activeStacks = secondaryStackSuccesses;
 		a_entry.appliedTier = a_tier;
 		a_entry.lastApplyMs = NowMs();
 		++g_counters.applySuccesses;
@@ -939,9 +1022,9 @@ namespace
 				TierShaderFormID(a_tier),
 				stackSuccesses,
 				stackCount,
-				a_tier == LootTier::Insane ? g_settings.insaneTierSecondaryShaderFormID : 0,
+				TierSecondaryShaderFormID(a_tier),
 				secondaryStackSuccesses,
-				a_tier == LootTier::Insane ? g_settings.insaneTierSecondaryStackCount : 0,
+				TierSecondaryStackCount(a_tier),
 				a_entry.name[0] ? a_entry.name : "<unnamed>");
 		}
 		return true;
@@ -1296,6 +1379,27 @@ namespace LootGlow::TieredLoot
 		return nullptr;
 	}
 
+
+	bool IsWornApparelFormForValue(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return false;
+		}
+#if LOOTGLOW_HAS_TESOBJECTCLOT_HEADER
+		// Oblivion clothing records include normal clothing and jewelry-style apparel.
+		if (a_form->As<RE::TESObjectCLOT>() != nullptr) {
+			return true;
+		}
+#endif
+#if LOOTGLOW_HAS_TESOBJECTARMO_HEADER
+		// Armor enchantments also use constant-effect worn-enchantment value rules.
+		if (a_form->As<RE::TESObjectARMO>() != nullptr) {
+			return true;
+		}
+#endif
+		return false;
+	}
+
 	float TryGetMagicItemCost(RE::EnchantmentItem* a_enchantment)
 	{
 #if LOOTGLOW_HAS_MAGICITEM_HEADER && LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER
@@ -1318,28 +1422,321 @@ namespace LootGlow::TieredLoot
 #endif
 	}
 
-	std::uint32_t EstimateFullGoldValue(RE::TESForm* a_form)
+	struct ItemValueDetails
 	{
-		const auto baseValue = GetItemBaseGoldValue(a_form);
-		if (!baseValue.available) {
-			return 0;
+		bool baseAvailable{ false };
+		std::uint32_t baseValue{ 0 };
+		bool enchantable{ false };
+		RE::TESFormID enchantmentFormID{ 0 };
+		float magicItemCost{ 0.0F };
+		float costOverride{ 0.0F };
+		std::uint32_t amountOfEnchantment{ 0 };
+		std::uint32_t enchantmentBonus{ 0 };
+		std::uint32_t wornEnchantMagnitude{ 0 };
+		std::uint32_t wornEnchantEffectCode{ 0 };
+		float wornEnchantBarterFactor{ 0.0F };
+		std::uint32_t wornEnchantBonus{ 0 };
+		std::uint32_t fullValue{ 0 };
+	};
+
+
+	bool TryReadPointerField(const void* a_ptr, std::uintptr_t a_offset, const void*& a_out)
+	{
+		a_out = nullptr;
+		if (!a_ptr) {
+			return false;
 		}
 
-		std::uint32_t fullValue = baseValue.value;
+#if defined(_MSC_VER)
+		__try {
+#endif
+			a_out = *reinterpret_cast<const void* const*>(reinterpret_cast<const std::uint8_t*>(a_ptr) + a_offset);
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+#endif
+
+		const auto raw = reinterpret_cast<std::uintptr_t>(a_out);
+		return raw > 0x10000;
+	}
+
+	bool TryReadU32Field(const void* a_ptr, std::uintptr_t a_offset, std::uint32_t& a_out)
+	{
+		a_out = 0;
+		if (!a_ptr) {
+			return false;
+		}
+
+#if defined(_MSC_VER)
+		__try {
+#endif
+			a_out = *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(a_ptr) + a_offset);
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+#endif
+		return true;
+	}
+
+
+	struct WornEnchantValueRule
+	{
+		float barterFactor{ 0.0F };
+		std::uint32_t flatCost{ 0 };
+		const char* label{ "unknown" };
+	};
+
+	bool TryGetWornEnchantValueRule(std::uint32_t a_effectCode, WornEnchantValueRule& a_outRule)
+	{
+		a_outRule = {};
+
+		// v0.4.1O: table-driven worn-apparel enchantment value rules, including flat-cost worn effects.
+		//
+		// Diagnostic v0.4.1E/F found the first enchantment effect entry at
+		// EnchantmentItem + 0x50, with stored magnitude at +0x0C and an observed
+		// effect/value code at +0x5C. For the two confirmed shirts:
+		//
+		//   effectCode 29, magnitude 6 -> Fortify Skill/Speechcraft-style:
+		//      base 6 + round(6 * 100) = 606
+		//
+		//   effectCode 66, magnitude 7 -> Resist Poison-style:
+		//      base 2 + round(7 * 15) = 107
+		//
+		// The nonzero rules below follow the Oblivion spell-effect barter-factor
+		// table for common constant-effect apparel enchantments. Unknown codes remain conservative and receive no guessed bonus. Night-Eye, Water Breathing, and Water Walking are flat-cost worn effects and use fixed gold bonuses regardless of magnitude.
+		switch (a_effectCode) {
+		// Attribute-style fortify effects.
+		case 0:   // Strength / Fortify Attribute-style
+		case 1:   // Intelligence / Fortify Attribute-style
+		case 2:   // Willpower / Fortify Attribute-style
+		case 3:   // Agility / Fortify Attribute-style
+		case 4:   // Speed / Fortify Attribute-style
+		case 5:   // Endurance / Fortify Attribute-style
+		case 6:   // Personality / Fortify Attribute-style
+		case 7:   // Luck / Fortify Attribute-style
+			a_outRule = { 100.0F, 0, "Fortify Attribute-style" };
+			return true;
+
+		// Derived actor-value style effects commonly available as worn enchantments.
+		case 8:
+			a_outRule = { 150.0F, 0, "Fortify Health-style" };
+			return true;
+		case 9:
+			a_outRule = { 100.0F, 0, "Fortify Magicka-style" };
+			return true;
+		case 10:
+			a_outRule = { 25.0F, 0, "Fortify Fatigue-style" };
+			return true;
+		case 11:
+			a_outRule = { 25.0F, 0, "Feather/Encumbrance-style" };
+			return true;
+
+		// Flat-cost constant-effect apparel enchantments. These do not scale by
+		// magnitude/soul level for item value. Night-Eye is a smaller fixed-cost
+		// effect, while Water Breathing and Water Walking use the larger flat cost.
+		// Keep these explicit so they cannot accidentally use a barter-factor
+		// multiplier if the effect-code path ever identifies them.
+		case 41:
+			a_outRule = { 0.0F, 100, "Night-Eye flat-cost" };
+			return true;
+		case 55:
+			a_outRule = { 0.0F, 2000, "Water Breathing flat-cost" };
+			return true;
+		case 56:
+			a_outRule = { 0.0F, 2000, "Water Walking flat-cost" };
+			return true;
+
+		// Skills: confirmed with Speechcraft-style item. Other skills should share
+		// the same Fortify Skill barter factor.
+		case 12:  // Armorer
+		case 13:  // Athletics
+		case 14:  // Blade
+		case 15:  // Block
+		case 16:  // Blunt
+		case 17:  // Hand to Hand
+		case 18:  // Heavy Armor
+		case 19:  // Alchemy
+		case 20:  // Alteration
+		case 21:  // Conjuration
+		case 22:  // Destruction
+		case 23:  // Illusion
+		case 24:  // Mysticism
+		case 25:  // Restoration
+		case 26:  // Acrobatics
+		case 27:  // Light Armor
+		case 28:  // Marksman
+		case 29:  // Mercantile/Speechcraft observed code path in diagnostic item
+		case 30:  // Security
+		case 31:  // Sneak
+		case 32:  // Speechcraft / Fortify Skill-style
+			a_outRule = { 100.0F, 0, "Fortify Skill-style" };
+			return true;
+
+		// Resist-style worn effects. The exact code ordering is still being
+		// validated, but code 66 = Resist Poison is confirmed by v0.4.1F.
+		case 60:
+			a_outRule = { 15.0F, 0, "Resist Disease-style" };
+			return true;
+		case 61:
+			a_outRule = { 50.0F, 0, "Resist Fire-style" };
+			return true;
+		case 62:
+			a_outRule = { 50.0F, 0, "Resist Frost-style" };
+			return true;
+		case 63:
+			a_outRule = { 150.0F, 0, "Resist Magic-style" };
+			return true;
+		case 64:
+			a_outRule = { 300.0F, 0, "Resist Normal Weapons-style" };
+			return true;
+		case 65:
+			a_outRule = { 30.0F, 0, "Resist Paralysis-style" };
+			return true;
+		case 66:
+			a_outRule = { 15.0F, 0, "Resist Poison-style" };
+			return true;
+		case 67:
+			a_outRule = { 50.0F, 0, "Resist Shock-style" };
+			return true;
+
+		default:
+			return false;
+		}
+	}
+
+	bool TryGetFlatCostWornEnchantBonusByEnchantmentFormID(RE::TESFormID a_enchantmentFormID, std::uint32_t& a_outBonus)
+	{
+		a_outBonus = 0;
+
+		// v0.4.1O: flat-cost constant-effect apparel enchantments can store
+		// magnitude=0 in the effect entry, so the normal magnitude/effect-code
+		// path cannot identify them reliably. Base-game flat-cost worn effects
+		// are therefore handled by known ENCH FormID before the magnitude gate.
+		//
+		// Confirmed by user test:
+		//   0000C05F = Water Walking apparel enchantment -> +2000
+		//   0000C061 = Water Breathing apparel enchantment -> +2000
+		//   00047855 = Night-Eye apparel enchantment -> +100
+		//
+		// These effects use fixed bonuses added to the base item value.
+		const auto raw = static_cast<std::uint32_t>(a_enchantmentFormID);
+		const auto compact = raw & 0x00FFFFFFU;
+
+		switch (compact) {
+		case 0x0000C05F:
+		case 0x0000C061:
+			a_outBonus = 2000;
+			return true;
+		case 0x00047855:
+			a_outBonus = 100;
+			return true;
+		default:
+			return false;
+		}
+	}
+
+
+	bool TryEstimateKnownWornEnchantBonus(RE::EnchantmentItem* a_enchantment, std::uint32_t& a_outBonus, std::uint32_t& a_outMagnitude, std::uint32_t& a_outEffectCode, float& a_outBarterFactor)
+	{
+		a_outBonus = 0;
+		a_outMagnitude = 0;
+		a_outEffectCode = 0;
+		a_outBarterFactor = 0.0F;
+
+		if (!a_enchantment) {
+			return false;
+		}
+
+		std::uint32_t flatFormBonus = 0;
+		if (TryGetFlatCostWornEnchantBonusByEnchantmentFormID(a_enchantment->GetFormID(), flatFormBonus)) {
+			a_outBonus = flatFormBonus;
+			a_outMagnitude = 0;
+			a_outEffectCode = 0;
+			a_outBarterFactor = 0.0F;
+			return true;
+		}
+
+		const void* effectEntry = nullptr;
+		if (!TryReadPointerField(a_enchantment, 0x50, effectEntry) || !effectEntry) {
+			return false;
+		}
+
+		std::uint32_t magnitude = 0;
+		std::uint32_t effectCode = 0;
+		if (!TryReadU32Field(effectEntry, 0x0C, magnitude) || !TryReadU32Field(effectEntry, 0x5C, effectCode)) {
+			return false;
+		}
+
+		if (magnitude == 0 || magnitude > 10000) {
+			return false;
+		}
+
+		WornEnchantValueRule rule{};
+		if (!TryGetWornEnchantValueRule(effectCode, rule)) {
+			a_outMagnitude = magnitude;
+			a_outEffectCode = effectCode;
+			return false;
+		}
+
+		a_outMagnitude = magnitude;
+		a_outEffectCode = effectCode;
+		a_outBarterFactor = rule.barterFactor;
+		a_outBonus = rule.flatCost > 0 ? rule.flatCost : static_cast<std::uint32_t>(std::lround(static_cast<float>(magnitude) * rule.barterFactor));
+		return a_outBonus > 0;
+	}
+
+
+	ItemValueDetails EstimateFullGoldValueDetails(RE::TESForm* a_form)
+	{
+		ItemValueDetails details{};
+		const auto baseValue = GetItemBaseGoldValue(a_form);
+		details.baseAvailable = baseValue.available;
+		details.baseValue = baseValue.value;
+		if (!baseValue.available) {
+			return details;
+		}
+
+		details.fullValue = baseValue.value;
 #if LOOTGLOW_HAS_TESENCHANTABLEFORM_HEADER && LOOTGLOW_HAS_ENCHANTMENTITEM_HEADER
 		auto* enchantable = GetEnchantableFormForValue(a_form);
-		if (!enchantable || !enchantable->formEnchanting) {
-			return fullValue;
+		details.enchantable = enchantable != nullptr;
+		if (enchantable && enchantable->formEnchanting) {
+			auto* enchantment = enchantable->formEnchanting;
+			details.enchantmentFormID = enchantment->GetFormID();
+			details.magicItemCost = TryGetMagicItemCost(enchantment);
+			details.costOverride = enchantment->data.costOverride > 0 ? static_cast<float>(enchantment->data.costOverride) : 0.0F;
+			details.amountOfEnchantment = static_cast<std::uint32_t>(enchantable->amountOfEnchantment);
+			const auto rawCost = details.magicItemCost > 0.0F ? details.magicItemCost : details.costOverride;
+			details.enchantmentBonus = static_cast<std::uint32_t>((0.4F * (rawCost + static_cast<float>(details.amountOfEnchantment))) + 0.5F);
+
+			if (IsWornApparelFormForValue(a_form)) {
+				std::uint32_t wornBonus = 0;
+				std::uint32_t wornMagnitude = 0;
+				std::uint32_t wornEffectCode = 0;
+				float wornBarterFactor = 0.0F;
+				if (TryEstimateKnownWornEnchantBonus(enchantment, wornBonus, wornMagnitude, wornEffectCode, wornBarterFactor)) {
+					details.wornEnchantBonus = wornBonus;
+					details.wornEnchantMagnitude = wornMagnitude;
+					details.wornEnchantEffectCode = wornEffectCode;
+					details.wornEnchantBarterFactor = wornBarterFactor;
+					if (details.wornEnchantBonus > details.enchantmentBonus) {
+						details.enchantmentBonus = details.wornEnchantBonus;
+					}
+				} else {
+					details.wornEnchantMagnitude = wornMagnitude;
+					details.wornEnchantEffectCode = wornEffectCode;
+					details.wornEnchantBarterFactor = wornBarterFactor;
+				}
+			}
+
+			details.fullValue += details.enchantmentBonus;
 		}
-		auto* enchantment = enchantable->formEnchanting;
-		const auto magicItemCost = TryGetMagicItemCost(enchantment);
-		const auto exposedCost = enchantment->data.costOverride > 0 ? static_cast<float>(enchantment->data.costOverride) : 0.0F;
-		const auto rawCost = magicItemCost > 0.0F ? magicItemCost : exposedCost;
-		const auto amountOfEnchantment = static_cast<float>(enchantable->amountOfEnchantment);
-		fullValue += static_cast<std::uint32_t>((0.4F * (rawCost + amountOfEnchantment)) + 0.5F);
 #endif
-		return fullValue;
+		return details;
 	}
+
 
 	struct ContainerValueSummary
 	{
@@ -1349,6 +1746,7 @@ namespace LootGlow::TieredLoot
 		std::uint32_t highestFullValueEach{ 0 };
 		std::uint32_t knownItems{ 0 };
 		std::uint32_t unknownItems{ 0 };
+		std::uint32_t uniqueItems{ 0 };
 
 		std::uint64_t KnownValueTotal() const
 		{
@@ -1361,6 +1759,480 @@ namespace LootGlow::TieredLoot
 			return highestFullValueEach > goldCandidate ? highestFullValueEach : goldCandidate;
 		}
 	};
+
+	bool IsKnownUniqueItem(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return false;
+		}
+
+		// v0.4.1O known unique/artifact item table.
+		// Source of truth: Unique_Artifact_List.xlsx rows marked Highlight=Yes,
+		// with Staff of Flame, Ayleid Long Sword, and Ayleid Mace intentionally
+		// excluded after review. Skeleton Key remains Unique by design.
+		const auto compact = GetFormID(a_form) & 0x00FFFFFFU;
+		switch (compact) {
+		// Blade
+		case 0x0CA154:  // Sunderblade
+			return true;
+		case 0x0091FB:  // Brusef Amelion's Sword
+			return true;
+		case 0x0CA158:  // Captain Kordan's Saber
+			return true;
+		case 0x0C891F:  // Dagger of Discipline
+			return true;
+		case 0x028BA0:  // Honorblade of Chorrol
+			return true;
+		case 0x0936B3:  // Mace of Doom
+			return true;
+		case 0x095A39:  // Redwave
+			return true;
+		case 0x095A3F:  // Redwave
+			return true;
+		case 0x0CA155:  // Akavari Warblade
+			return true;
+		case 0x00172E:  // Sinweaver
+			return true;
+
+		// Blunt
+		case 0x0CB6F3:  // Calliben's Grim Retort
+			return true;
+		case 0x0CA157:  // Truncheon of Submission
+			return true;
+		case 0x0CA152:  // Battleaxe of Hatred
+			return true;
+		case 0x0CA159:  // Destarine's Cleaver
+			return true;
+		case 0x082DE3:  // Perdition's Wrath
+			return true;
+
+		// Bow
+		case 0x0CA156:  // Bow of Infliction
+			return true;
+		case 0x082DE4:  // Bow of Infernal Frost
+			return true;
+		case 0x0C55E4:  // Frostwyrm Bow
+			return true;
+
+		// Armor
+		case 0x12DD1B:  // Brusef Amelion's Boots
+			return true;
+		case 0x0091FA:  // Brusef Amelion's Cuirass
+			return true;
+		case 0x12DD1A:  // Brusef Amelion's Gauntlets
+			return true;
+		case 0x12DD18:  // Brusef Amelion's Greaves
+			return true;
+		case 0x12DD19:  // Brusef Amelion's Helmet
+			return true;
+		case 0x12DD1C:  // Brusef Amelion's Shield
+			return true;
+		case 0x0ADD4E:  // Imperial Dragon Boots Heavy
+			return true;
+		case 0x0ADDA3:  // Imperial Dragon Boots Light
+			return true;
+		case 0x0ADDAA:  // Imperial Dragon Cuirass Heavy
+			return true;
+		case 0x0ADD50:  // Imperial Dragon Cuirass Light
+			return true;
+		case 0x0ADD51:  // Imperial Dragon Gauntlets Heavy
+			return true;
+		case 0x0ADE26:  // Imperial Dragon Gauntlets Light
+			return true;
+		case 0x0ADD52:  // Imperial Dragon Greaves Heavy
+			return true;
+		case 0x0ADE27:  // Imperial Dragon Greaves Light
+			return true;
+		case 0x0ADDA2:  // Imperial Dragon Helmet Heavy
+			return true;
+		case 0x0ADE2A:  // Imperial Dragon Helmet Light
+			return true;
+		case 0x0347F7:  // Shrouded Armor
+			return true;
+		case 0x0347F4:  // Shrouded Hood
+			return true;
+
+		// Light Boots
+		case 0x0CA111:  // Boots of the Swift Merchant
+			return true;
+		case 0x0CA113:  // Quicksilver Boots
+			return true;
+
+		// Heavy Cuirass
+		case 0x0CA117:  // Aegis of the Apocalypse
+			return true;
+
+		// Light Cuirass
+		case 0x0CA110:  // Birthright of Astalon
+			return true;
+
+		// Heavy Cuirass
+		case 0x0CA10F:  // Dondoran's Juggernaut
+			return true;
+
+		// Light Bracers
+		case 0x0C47B1:  // Bands of Kwang Lao
+			return true;
+
+		// Heavy Gauntlets
+		case 0x0CA11A:  // Fists of the Drunkard
+			return true;
+		case 0x0CA11C:  // Gauntlets of Gluttony
+			return true;
+
+		// Light Gauntlets
+		case 0x082DDF:  // Hands of Midnight
+			return true;
+
+		// Heavy Gauntlets
+		case 0x0CA118:  // Hands of the Atronach
+			return true;
+		case 0x0CA114:  // Rasheda's Special
+			return true;
+
+		// Light Greaves
+		case 0x0CA112:  // Monkeypants
+			return true;
+
+		// Light Helm
+		case 0x082DD8:  // Fin Gleam
+			return true;
+
+		// Heavy Helm
+		case 0x0CA119:  // Helm of the Deep Delver
+			return true;
+		case 0x0CA11B:  // Helm of Ferocity
+			return true;
+
+		// Heavy Shield
+		case 0x0CA116:  // Tower of the Nine
+			return true;
+
+		// Jewelry
+		case 0x082DE0:  // Eye of Sithis
+			return true;
+		case 0x0856EF:  // Jewel of the Rumare
+			return true;
+
+		// Boots
+		case 0x0148D4:  // Boots of Springheel Jak
+			return true;
+		case 0x0CA12B:  // Nistor's Boots
+			return true;
+
+		// Hood
+		case 0x0651D3:  // Black Hand Hood
+			return true;
+		case 0x0CA12C:  // Councilor's Hood
+			return true;
+		case 0x0CA121:  // Cowl of the Druid
+			return true;
+		case 0x0CA129:  // Mantle of the Woodsman
+			return true;
+		case 0x0CA124:  // Veil of the Seer
+			return true;
+
+		// Pants
+		case 0x0CA125:  // Imperial Breeches
+			return true;
+
+		// Ring
+		case 0x098175:  // Blackwood Ring of Silence
+			return true;
+		case 0x088FED:  // Circlet of Omnipotence
+			return true;
+		case 0x00CCC8:  // Ring of the Gray
+			return true;
+		case 0x0CA126:  // Ring of Transmutation
+			return true;
+		case 0x0CA128:  // Ring of Wortcraft
+			return true;
+		case 0x0CA12A:  // Spectre Ring
+			return true;
+
+		// Robe
+		case 0x0651D2:  // Black Hand Robe
+			return true;
+
+		// Shirt
+		case 0x0CA122:  // Apron of the Master Artisan
+			return true;
+		case 0x0CA127:  // Robe of Creativity
+			return true;
+		case 0x0CA123:  // Vest of the Bard
+			return true;
+
+		// Misc
+		case 0x0918FD:  // Scales of Pitiless Justice
+			return true;
+
+		// Staff
+		case 0x0BE320:  // Mankar Camoran's Staff
+			return true;
+		case 0x0BE321:  // Mankar Camoran's Staff
+			return true;
+		case 0x0BE322:  // Mankar Camoran's Staff
+			return true;
+		case 0x0335AF:  // Staff of Indarys
+			return true;
+		case 0x06B66D:  // Staff of Indarys
+			return true;
+		case 0x06B66E:  // Staff of Indarys
+			return true;
+		case 0x06B66F:  // Staff of Indarys
+			return true;
+		case 0x06B670:  // Staff of Indarys
+			return true;
+		case 0x06B671:  // Staff of Indarys
+			return true;
+		case 0x0CA153:  // Apotheosis
+			return true;
+		case 0x0AA01F:  // Goblin Totem Staff
+			return true;
+		case 0x047372:  // Hrormir's Icestaff
+			return true;
+		case 0x0228EF:  // Sanguine Rose
+			return true;
+		case 0x027116:  // Skull of Corruption
+			return true;
+		case 0x0493BD:  // Staff of the Battlemage
+			return true;
+		case 0x056E50:  // Staff of Unholy Terror
+			return true;
+		case 0x04A24E:  // Staff of Worms
+			return true;
+		case 0x0355A6:  // Unfinished Staff
+			return true;
+		case 0x0228F0:  // Wabbajack
+			return true;
+
+		// Artifact
+		case 0x00C201:  // BlackwaterBlade
+			return true;
+		case 0x06B697:  // BlackwaterBlade
+			return true;
+		case 0x06B698:  // BlackwaterBlade
+			return true;
+		case 0x06B699:  // BlackwaterBlade
+			return true;
+		case 0x06B69A:  // BlackwaterBlade
+			return true;
+		case 0x06B69B:  // BlackwaterBlade
+			return true;
+		case 0x01D0B4:  // Debaser
+			return true;
+		case 0x06BD81:  // Debaser
+			return true;
+		case 0x06BD82:  // Debaser
+			return true;
+		case 0x06BD83:  // Debaser
+			return true;
+		case 0x06BD84:  // Debaser
+			return true;
+		case 0x06BD85:  // Debaser
+			return true;
+		case 0x027109:  // Ebony Blade
+			return true;
+		case 0x027105:  // Gold Brand
+			return true;
+		case 0x027117:  // Mace of Molag Bal
+			return true;
+		case 0x00BEA6:  // Rugdumph's Sword
+			return true;
+		case 0x0335AE:  // ThornBlade
+			return true;
+		case 0x06B661:  // ThornBlade
+			return true;
+		case 0x06B662:  // ThornBlade
+			return true;
+		case 0x06B663:  // ThornBlade
+			return true;
+		case 0x06B664:  // ThornBlade
+			return true;
+		case 0x06B665:  // ThornBlade
+			return true;
+		case 0x026B22:  // Umbra
+			return true;
+		case 0x09DB4F:  // Volendrung
+			return true;
+		case 0x06B1B9:  // Witsplinter
+			return true;
+		case 0x06B1C0:  // Witsplinter
+			return true;
+		case 0x06B1C1:  // Witsplinter
+			return true;
+		case 0x06B1C2:  // Witsplinter
+			return true;
+		case 0x06B1C3:  // Witsplinter
+			return true;
+		case 0x06B1C4:  // Witsplinter
+			return true;
+		case 0x0C5B4A:  // Apron of Adroitness
+			return true;
+		case 0x0C5B4B:  // Apron of Adroitness
+			return true;
+		case 0x0C5B4C:  // Apron of Adroitness
+			return true;
+		case 0x0C5B4D:  // Apron of Adroitness
+			return true;
+		case 0x0C5B4E:  // Apron of Adroitness
+			return true;
+		case 0x0C5B4F:  // Apron of Adroitness
+			return true;
+		case 0x0A55FA:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0BE5DA:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0BE5D1:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0BE5D2:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0BE5D3:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0BE5D4:  // Ayleid Crown of Lindai
+			return true;
+		case 0x0A933E:  // Ayleid Crown of Lindai (Ruined)
+			return true;
+		case 0x0A55FB:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x0BE5D5:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x0BE5D6:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x0BE5D7:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x0BE5D8:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x0BE5D9:  // Ayleid Crown of Nenalata
+			return true;
+		case 0x014673:  // Bloodworm Helm
+			return true;
+		case 0x07BE3F:  // Bloodworm Helm
+			return true;
+		case 0x07BE40:  // Bloodworm Helm
+			return true;
+		case 0x07BE41:  // Bloodworm Helm
+			return true;
+		case 0x07BE42:  // Bloodworm Helm
+			return true;
+		case 0x07BE43:  // Bloodworm Helm
+			return true;
+		case 0x0348A6:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348A7:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348A8:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348A9:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348AA:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348AB:  // Boots of Bloody Bounding
+			return true;
+		case 0x0348AC:  // Boots of Bloody Bounding
+			return true;
+		case 0x08B07D:  // Escutcheon of Chorrol
+			return true;
+		case 0x06BDFA:  // Escutcheon of Chorrol
+			return true;
+		case 0x06BDFB:  // Escutcheon of Chorrol
+			return true;
+		case 0x06BDFC:  // Escutcheon of Chorrol
+			return true;
+		case 0x06BDFD:  // Escutcheon of Chorrol
+			return true;
+		case 0x06BDFE:  // Escutcheon of Chorrol
+			return true;
+		case 0x0A5659:  // Helm of Oreyn Bearclaw
+			return true;
+		case 0x0228EE:  // Masque of Clavicus Vile
+			return true;
+		case 0x027107:  // Saviour's Hide
+			return true;
+		case 0x0897C2:  // Spell Breaker
+			return true;
+		case 0x07304D:  // Draconian Madstone
+			return true;
+		case 0x022E81:  // Gray Cowl of Nocturnal
+			return true;
+		case 0x0C89CB:  // Jewel of the Rumare
+			return true;
+		case 0x0146C6:  // Necromancer's Amulet
+			return true;
+		case 0x07BE27:  // Necromancer's Amulet
+			return true;
+		case 0x07BE28:  // Necromancer's Amulet
+			return true;
+		case 0x07BE29:  // Necromancer's Amulet
+			return true;
+		case 0x07BE2A:  // Necromancer's Amulet
+			return true;
+		case 0x07BE2B:  // Necromancer's Amulet
+			return true;
+		case 0x04F9E5:  // Ring of Eidolon's Edge
+			return true;
+		case 0x06BD6B:  // Ring of Eidolon's Edge
+			return true;
+		case 0x06BD6C:  // Ring of Eidolon's Edge
+			return true;
+		case 0x06BD6D:  // Ring of Eidolon's Edge
+			return true;
+		case 0x06BD6E:  // Ring of Eidolon's Edge
+			return true;
+		case 0x06BD6F:  // Ring of Eidolon's Edge
+			return true;
+		case 0x027110:  // Ring of Khajiiti
+			return true;
+		case 0x01C10A:  // Ring of Namira
+			return true;
+		case 0x01E0FA:  // Ring of Sunfire
+			return true;
+		case 0x06B689:  // Ring of Sunfire
+			return true;
+		case 0x06B68A:  // Ring of Sunfire
+			return true;
+		case 0x06B68B:  // Ring of Sunfire
+			return true;
+		case 0x06B68C:  // Ring of Sunfire
+			return true;
+		case 0x06B68D:  // Ring of Sunfire
+			return true;
+		case 0x095A71:  // Spelldrinker Amulet
+			return true;
+		case 0x095A6B:  // Spelldrinker Amulet
+			return true;
+		case 0x095A6C:  // Spelldrinker Amulet
+			return true;
+		case 0x095A6D:  // Spelldrinker Amulet
+			return true;
+		case 0x095A6E:  // Spelldrinker Amulet
+			return true;
+		case 0x095A6F:  // Spelldrinker Amulet
+			return true;
+		case 0x095A70:  // Spelldrinker Amulet
+			return true;
+		case 0x18A88D:  // Weatherward Circlet
+			return true;
+		case 0x06BD71:  // Weatherward Circlet
+			return true;
+		case 0x06BD72:  // Weatherward Circlet
+			return true;
+		case 0x06BD73:  // Weatherward Circlet
+			return true;
+		case 0x06BD74:  // Weatherward Circlet
+			return true;
+		case 0x06BD75:  // Weatherward Circlet
+			return true;
+		case 0x000193:  // Azura's Star
+			return true;
+		case 0x0228F1:  // Oghma Infinium
+			return true;
+		case 0x00000B:  // Skeleton Key
+			return true;
+		default:
+			return false;
+		}
+	}
 
 	bool IsExactGoldForm(RE::TESForm* a_form)
 	{
@@ -1412,7 +2284,38 @@ namespace LootGlow::TieredLoot
 			return;
 		}
 
-		const auto fullValueEach = EstimateFullGoldValue(a_form);
+		const bool knownUniqueItem = g_settings.uniqueItemMode && IsKnownUniqueItem(a_form);
+		if (knownUniqueItem) {
+			a_summary.uniqueItems += static_cast<std::uint32_t>(a_count);
+		}
+
+		const auto valueDetails = EstimateFullGoldValueDetails(a_form);
+		const auto fullValueEach = valueDetails.fullValue;
+		if (g_settings.debugItemValues) {
+			const char* itemName = "<unnamed>";
+			if (auto* rawName = RE::TESFullName::GetFullName(a_form)) {
+				itemName = rawName;
+			}
+			REX::INFO("[LootGlow] item value diagnostic: form={:08X}, count={}, uniqueKnown={}, baseAvailable={}, baseValue={}, enchantable={}, enchantment={:08X}, magicCost={:.2f}, costOverride={:.2f}, charge={}, enchantmentBonus={}, wornEnchantMagnitude={}, wornEnchantEffectCode={}, wornEnchantBarterFactor={:.2f}, wornEnchantBonus={}, fullValueEach={}, stackValue={}, name={}",
+				GetFormID(a_form),
+				a_count,
+				knownUniqueItem,
+				valueDetails.baseAvailable,
+				valueDetails.baseValue,
+				valueDetails.enchantable,
+				static_cast<std::uint32_t>(valueDetails.enchantmentFormID),
+				valueDetails.magicItemCost,
+				valueDetails.costOverride,
+				valueDetails.amountOfEnchantment,
+				valueDetails.enchantmentBonus,
+				valueDetails.wornEnchantMagnitude,
+				valueDetails.wornEnchantEffectCode,
+				valueDetails.wornEnchantBarterFactor,
+				valueDetails.wornEnchantBonus,
+				fullValueEach,
+				static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(a_count),
+				itemName);
+		}
 		if (fullValueEach > 0) {
 			++a_summary.knownItems;
 			a_summary.knownFullValueTotal += static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(a_count);
@@ -1498,7 +2401,8 @@ namespace LootGlow::TieredLoot
 		const auto summary = ScanContainerValue(a_ref, container);
 		const auto knownValueTotal = summary.KnownValueTotal();
 		const auto highestValueCandidate = summary.HighestValueCandidate();
-		const auto desiredTier = ::SelectTier(knownValueTotal, highestValueCandidate);
+		const bool uniqueDetected = g_settings.uniqueItemMode && summary.uniqueItems > 0;
+		const auto desiredTier = uniqueDetected ? LootTier::Unique : ::SelectTier(knownValueTotal, highestValueCandidate);
 		const bool lockpickDetected = g_settings.lockpickMode && summary.lockpickTotalCount > 0;
 
 		// v0.4.0G rule:
@@ -1508,6 +2412,9 @@ namespace LootGlow::TieredLoot
 		const bool desiredLockpickGlow = lockpickDetected && !lockpickSuppressedByValueTier;
 		const DesiredVisualPlan desiredPlan{ desiredTier, desiredLockpickGlow };
 		switch (desiredTier) {
+		case LootTier::Unique:
+			++g_counters.tierUnique;
+			break;
 		case LootTier::Insane:
 			++g_counters.tierInsane;
 			break;
@@ -1538,11 +2445,12 @@ namespace LootGlow::TieredLoot
 			entry->lastLockpickTotalCount != summary.lockpickTotalCount;
 
 		if (classificationChanged && g_settings.debugLogging) {
-			REX::INFO("[LootGlow] {} scan: ref={:08X}/{:08X}, desired={} lockpick={} suppressed={}, value={}, highest={}, gold={}, picks={}, name={}",
+			REX::INFO("[LootGlow] {} scan: ref={:08X}/{:08X}, desired={} uniqueItems={} lockpick={} suppressed={}, value={}, highest={}, gold={}, picks={}, name={}",
 				a_source ? a_source : "scan",
 				GetFormID(a_ref),
 				entry->baseFormID,
 				TierName(desiredTier),
+				summary.uniqueItems,
 				desiredLockpickGlow,
 				lockpickSuppressedByValueTier,
 				knownValueTotal,
@@ -1564,7 +2472,7 @@ namespace LootGlow::TieredLoot
 			desiredTier != LootTier::None &&
 			(!entry->valueGlow.applied ||
 				entry->valueGlow.activeStacks < ::TierStackCount(desiredTier) ||
-				(desiredTier == LootTier::Insane && g_settings.insaneTierSecondaryEnabled && g_settings.insaneTierSecondaryShaderFormID != 0 && (!entry->insaneSecondaryGlow.applied || entry->insaneSecondaryGlow.activeStacks < g_settings.insaneTierSecondaryStackCount)));
+				(TierSecondaryEnabled(desiredTier) && TierSecondaryShaderFormID(desiredTier) != 0 && (!entry->secondaryGlow.applied || entry->secondaryGlow.activeStacks < TierSecondaryStackCount(desiredTier))));
 		const bool lockpickStackMismatch =
 			desiredLockpickGlow &&
 			(!entry->lockpickGlow.applied || entry->lockpickGlow.activeStacks < g_settings.lockpickStackCount);
@@ -1679,9 +2587,15 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 
 	LoadSettings();
 
-	REX::INFO("LootGlow v0.4.0 initialized");
-	REX::INFO("Tier settings: aggregateMode={}, Low(enabled={}, threshold={}, shader={:08X}, stacks={}), Medium(enabled={}, threshold={}, shader={:08X}, stacks={}), High(enabled={}, threshold={}, shader={:08X}, stacks={}), Insane(enabled={}, threshold={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Lockpick(enabled={}, form={:08X}, shader={:08X}, stacks={})",
+	REX::INFO("LootGlow v0.4.1Q public defaults initialized");
+	REX::INFO("Tier settings: aggregateMode={}, Unique(enabled={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Low(enabled={}, threshold={}, shader={:08X}, stacks={}), Medium(enabled={}, threshold={}, shader={:08X}, stacks={}), High(enabled={}, threshold={}, shader={:08X}, stacks={}), Insane(enabled={}, threshold={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Lockpick(enabled={}, form={:08X}, shader={:08X}, stacks={})",
 		g_settings.valueAggregateMode,
+		g_settings.uniqueItemMode,
+		g_settings.uniqueItemShaderFormID,
+		g_settings.uniqueItemStackCount,
+		g_settings.uniqueItemSecondaryEnabled,
+		g_settings.uniqueItemSecondaryShaderFormID,
+		g_settings.uniqueItemSecondaryStackCount,
 		g_settings.lowTierEnabled,
 		g_settings.lowTierThreshold,
 		g_settings.lowTierShaderFormID,
@@ -1707,7 +2621,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 		g_settings.lockpickStackCount);
 	REX::INFO("Visual refresh settings: refreshMode={} (0=off, 1=load/graphics defensive refresh)",
 		g_settings.visualRefreshMode);
-	REX::INFO("v0.4.0 behavior: four exclusive value tiers suppress lockpick glow; Insane can apply a configurable secondary accent shader; VisualRefreshMode=1 refreshes value-tier visuals on LoadGraphics, no periodic value blink");
+	REX::INFO("v0.4.1Q behavior: Unique known-item primary+secondary shaders take priority over monetary tiers and lockpick glow; table-driven worn enchant value rules remain active; flat-cost worn effects include Night-Eye +100 and Water Breathing/Walking +2000; unknown effect codes remain conservative and are logged in DebugItemValues");
 	if (g_settings.debugLogging) {
 		MaybeLogStats("startup", true);
 	}
