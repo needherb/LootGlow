@@ -2,7 +2,7 @@
 
 LootGlow is an OBSE64 plugin for **The Elder Scrolls IV: Oblivion Remastered** that highlights loot containers based on what is inside them.
 
-The goal is simple: valuable, useful, or unique containers should be easier to notice at a glance without opening every chest, coffin, barrel, or sack.
+Simply put, valuable, useful, or unique containers should be easier to notice at a glance without opening every chest, coffin, barrel, or sack.
 
 ## Features
 
@@ -19,7 +19,6 @@ The goal is simple: valuable, useful, or unique containers should be easier to n
 - Value tiers suppress lockpick-only glow, so a valuable container with lockpicks still uses the value-tier visual.
 - Supports total-value or highest-item-value detection.
 - Includes a defensive visual refresh option for containers whose graphics load or reload after the initial scan.
-- No engine tick refresh, background thread, async refresh loop, or periodic shader refresh loop.
 
 ## Requirements
 
