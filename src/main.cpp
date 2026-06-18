@@ -153,7 +153,6 @@ namespace
 	constexpr std::uint32_t kMaxTrackedRefs = 8192;
 	constexpr std::uint64_t kStatsLogIntervalMs = 30000;
 	constexpr std::uint64_t kStatsMilestoneInterval = 25;
-	constexpr std::uint64_t kLockpickRefreshIntervalMs = 1200;
 	constexpr std::uint64_t kLoadVisualRefreshCooldownMs = 12000;
 
 	constexpr std::uintptr_t kMagicShaderHitEffectSize = 0xA0;
@@ -2478,33 +2477,24 @@ namespace LootGlow::TieredLoot
 			(!entry->lockpickGlow.applied || entry->lockpickGlow.activeStacks < g_settings.lockpickStackCount);
 
 		const auto now = NowMs();
-		const bool lockpickRefreshDue =
-			desiredLockpickGlow &&
-			desiredTier == LootTier::None &&
-			entry->appliedLockpickGlow &&
-			entry->lockpickGlow.applied &&
-			entry->lastApplyMs != 0 &&
-			now - entry->lastApplyMs >= kLockpickRefreshIntervalMs;
-
+		const bool loadRefreshTargetActive =
+			(desiredTier != LootTier::None && entry->appliedTier == desiredTier && entry->valueGlow.applied) ||
+			(desiredLockpickGlow && entry->appliedLockpickGlow && entry->lockpickGlow.applied);
 		const bool loadRefreshDue =
 			g_settings.visualRefreshMode &&
 			a_source &&
 			std::strcmp(a_source, "loadgraphics") == 0 &&
-			desiredTier != LootTier::None &&
-			entry->appliedTier == desiredTier &&
-			entry->valueGlow.applied &&
+			loadRefreshTargetActive &&
 			(entry->lastLoadRefreshMs == 0 || now - entry->lastLoadRefreshMs >= kLoadVisualRefreshCooldownMs);
 
 		const DesiredVisualPlan appliedPlan{ entry->appliedTier, entry->appliedLockpickGlow };
-		if (::SamePlan(desiredPlan, appliedPlan) && !valueStackMismatch && !lockpickStackMismatch && !lockpickRefreshDue && !loadRefreshDue) {
+		if (::SamePlan(desiredPlan, appliedPlan) && !valueStackMismatch && !lockpickStackMismatch && !loadRefreshDue) {
 			++g_counters.skippedNoChange;
 			return desiredTier != LootTier::None || desiredLockpickGlow;
 		}
 
 		const char* rebuildReason = "visual plan changed";
-		if (lockpickRefreshDue) {
-			rebuildReason = "lockpick refresh";
-		} else if (loadRefreshDue) {
+		if (loadRefreshDue) {
 			rebuildReason = "load visual refresh";
 			entry->lastLoadRefreshMs = now;
 			++g_counters.visualRefreshes;
@@ -2587,7 +2577,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 
 	LoadSettings();
 
-	REX::INFO("LootGlow v0.4.1Q public defaults initialized");
+	REX::INFO("LootGlow v0.4.1R lockpick refresh cleanup initialized");
 	REX::INFO("Tier settings: aggregateMode={}, Unique(enabled={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Low(enabled={}, threshold={}, shader={:08X}, stacks={}), Medium(enabled={}, threshold={}, shader={:08X}, stacks={}), High(enabled={}, threshold={}, shader={:08X}, stacks={}), Insane(enabled={}, threshold={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Lockpick(enabled={}, form={:08X}, shader={:08X}, stacks={})",
 		g_settings.valueAggregateMode,
 		g_settings.uniqueItemMode,
