@@ -10,10 +10,17 @@
 #include <cstring>
 #include <cmath>
 #include <string_view>
+#include <type_traits>
 
 #include <Windows.h>
 
 #include "RE/T/TESFullName.h"
+#if __has_include("RE/T/TESValueForm.h")
+#	include "RE/T/TESValueForm.h"
+#	define LOOTGLOW_HAS_TESVALUEFORM_HEADER 1
+#else
+#	define LOOTGLOW_HAS_TESVALUEFORM_HEADER 0
+#endif
 #if __has_include("RE/T/TESObjectMISC.h")
 #	include "RE/T/TESObjectMISC.h"
 #	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 1
@@ -106,10 +113,11 @@
 #endif
 #include "RE/T/TESObjectCONT.h"
 #include "RE/T/TESObjectREFR.h"
+#include "RE/P/PlayerCharacter.h"
 
 namespace
 {
-	// v0.4.1O: four value tiers plus one special Unique-item shader category.
+	// v0.4.2: four value tiers plus one special Unique-item shader category.
 	//
 	// This file intentionally drops the old independent gold/high-value/lockpick
 	// visual state machine. A scan computes one desired visual plan, then all owned
@@ -137,10 +145,10 @@ namespace
 	constexpr RE::TESFormID kDefaultUniqueItemShaderFormID = 0x000852FE;  // Unique/artifact primary shader default
 	constexpr RE::TESFormID kDefaultUniqueItemSecondaryShaderFormID = 0x0018B579;  // Unique/artifact secondary accent shader default
 	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;    // STRP / purple Soul Trap hit effect
-	constexpr std::uint32_t kDefaultLowTierThreshold = 25;
+	constexpr std::uint32_t kDefaultLowTierThreshold = 10;
 	constexpr std::uint32_t kDefaultMediumTierThreshold = 100;
-	constexpr std::uint32_t kDefaultHighTierThreshold = 250;
-	constexpr std::uint32_t kDefaultInsaneTierThreshold = 500;
+	constexpr std::uint32_t kDefaultHighTierThreshold = 300;
+	constexpr std::uint32_t kDefaultInsaneTierThreshold = 1000;
 	constexpr std::uint32_t kDefaultLowTierStackCount = 4;
 	constexpr std::uint32_t kDefaultMediumTierStackCount = 8;
 	constexpr std::uint32_t kDefaultHighTierStackCount = 4;
@@ -240,12 +248,25 @@ namespace
 		std::int32_t lastLockpickTotalCount{ -1 };
 		std::uint64_t lastApplyMs{ 0 };
 		std::uint64_t lastLoadRefreshMs{ 0 };
+		bool leveledMaterializationDone{ false };
 		char name[96]{};
 	};
 
 	struct Counters
 	{
 		std::uint64_t loadGraphicsHits{ 0 };
+		std::uint64_t loadGraphicsTrackedNew{ 0 };
+		std::uint64_t loadGraphicsTrackedExisting{ 0 };
+		std::uint64_t hoverUpdateHits{ 0 };
+		std::uint64_t hoverUpdateContainers{ 0 };
+		std::uint64_t hoverUpdateTrackedBefore{ 0 };
+		std::uint64_t hoverUpdateTrackedAfter{ 0 };
+		std::uint64_t playerDoorTransitionBegins{ 0 };
+		std::uint64_t playerDoorTransitionArrivals{ 0 };
+		std::uint64_t postDoorDualRepairAttempts{ 0 };
+		std::uint64_t postDoorDualRepairSuccesses{ 0 };
+		std::uint64_t postDoorDualRepairFailures{ 0 };
+		std::uint64_t postDoorDualRepairSkipped{ 0 };
 		std::uint64_t containerLoadHits{ 0 };
 		std::uint64_t trackedContainers{ 0 };
 		std::uint64_t scanCalls{ 0 };
@@ -264,6 +285,10 @@ namespace
 		std::uint64_t removeSuccesses{ 0 };
 		std::uint64_t skippedNoChange{ 0 };
 		std::uint64_t visualRefreshes{ 0 };
+		std::uint64_t pendingMaterializeCandidates{ 0 };
+		std::uint64_t pendingMaterializeAttempts{ 0 };
+		std::uint64_t pendingMaterializeResolved{ 0 };
+		std::uint64_t pendingMaterializeNoChange{ 0 };
 		std::uint64_t shaderResolveFailures{ 0 };
 		std::uint64_t trackingTableFull{ 0 };
 		std::uint64_t pointerReuseResets{ 0 };
@@ -285,6 +310,8 @@ namespace
 	static std::uint64_t g_lastStatsTrackedContainers{ 0 };
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
 	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
+	static bool g_playerDoorTransitionActive{ false };
+	static std::uint64_t g_playerDoorTransitionSeq{ 0 };
 
 	const char* TierName(LootTier a_tier)
 	{
@@ -302,6 +329,11 @@ namespace
 		default:
 			return "None";
 		}
+	}
+
+	std::uintptr_t PtrValue(const void* a_ptr)
+	{
+		return reinterpret_cast<std::uintptr_t>(a_ptr);
 	}
 
 	std::uint32_t ClampStackCount(std::uint32_t a_value)
@@ -843,13 +875,15 @@ namespace
 		}
 
 		g_lastStatsLogMs = now;
-		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, scans={}, tiers={}/{}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, removes={}, skipped={}, refreshes={}, shaderFails={}, tableFull={}, reuseResets={}",
+		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, hover={}/{}, scans={}, tiers={}/{}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, removes={}, skipped={}, refreshes={}, matFix={}/{}/{}/{}, shaderFails={}, tableFull={}, reuseResets={}, playerDoorTransitions={}/{}, postDoorDualRepair={}/{}/{}/skipped:{}",
 			a_reason ? a_reason : "stats",
 			CountTrackedRefs(),
 			kMaxTrackedRefs,
 			CountGlowingRefs(),
 			g_counters.loadGraphicsHits,
 			g_counters.containerLoadHits,
+			g_counters.hoverUpdateHits,
+			g_counters.hoverUpdateContainers,
 			g_counters.scanCalls,
 			g_counters.tierNone,
 			g_counters.tierUnique,
@@ -864,10 +898,21 @@ namespace
 			g_counters.removeSuccesses,
 			g_counters.skippedNoChange,
 			g_counters.visualRefreshes,
+			g_counters.pendingMaterializeCandidates,
+			g_counters.pendingMaterializeAttempts,
+			g_counters.pendingMaterializeResolved,
+			g_counters.pendingMaterializeNoChange,
 			g_counters.shaderResolveFailures,
 			g_counters.trackingTableFull,
-			g_counters.pointerReuseResets);
+			g_counters.pointerReuseResets,
+			g_counters.playerDoorTransitionBegins,
+			g_counters.playerDoorTransitionArrivals,
+			g_counters.postDoorDualRepairSuccesses,
+			g_counters.postDoorDualRepairAttempts,
+			g_counters.postDoorDualRepairFailures,
+			g_counters.postDoorDualRepairSkipped);
 	}
+
 
 	TrackedRef* TrackContainer(RE::TESObjectREFR* a_ref, RE::TESObjectCONT* a_container, std::string_view a_name)
 	{
@@ -976,6 +1021,27 @@ namespace
 		a_entry.secondaryGlow = GlowStackState{};
 
 		++g_counters.applyAttempts;
+
+		// v0.4.1Y dual-shader order fix:
+		// Apply secondary/accent stacks first, then apply the primary tier shader last.
+		// The engine's final visible shader can be order-sensitive; applying the primary
+		// last preserves the tier's main visual while retaining the secondary accent.
+		RE::TESEffectShader* secondaryShader = nullptr;
+		const auto secondaryStackCount = TierSecondaryEnabled(a_tier) ? TierSecondaryStackCount(a_tier) : 0u;
+		if (TierSecondaryEnabled(a_tier)) {
+			secondaryShader = ResolveTierSecondaryShader(a_tier);
+			if (secondaryShader) {
+				for (std::uint32_t stackIndex = 0; stackIndex < secondaryStackCount; ++stackIndex) {
+					void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
+					if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
+						REX::INFO("LootGlow {} secondary tier stack {}/{} failed for ref={:016X}", TierName(a_tier), stackIndex + 1, secondaryStackCount, a_entry.ref);
+						continue;
+					}
+					++secondaryStackSuccesses;
+				}
+			}
+		}
+
 		for (std::uint32_t stackIndex = 0; stackIndex < stackCount; ++stackIndex) {
 			void* effect = ConstructMagicShaderHitEffect(a_ref, shader, -1.0f);
 			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
@@ -986,22 +1052,11 @@ namespace
 		}
 
 		if (stackSuccesses == 0) {
+			if (secondaryShader && secondaryStackSuccesses > 0) {
+				FinishTrackedStack(a_ref, secondaryShader, GlowStackState{ true, secondaryStackSuccesses });
+			}
 			++g_counters.applyFailures;
 			return false;
-		}
-
-		if (TierSecondaryEnabled(a_tier)) {
-			if (auto* secondaryShader = ResolveTierSecondaryShader(a_tier)) {
-				const auto secondaryStackCount = TierSecondaryStackCount(a_tier);
-				for (std::uint32_t stackIndex = 0; stackIndex < secondaryStackCount; ++stackIndex) {
-					void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
-					if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-						REX::INFO("LootGlow {} secondary tier stack {}/{} failed for ref={:016X}", TierName(a_tier), stackIndex + 1, secondaryStackCount, a_entry.ref);
-						continue;
-					}
-					++secondaryStackSuccesses;
-				}
-			}
 		}
 
 		a_entry.valueGlow.applied = true;
@@ -1027,6 +1082,194 @@ namespace
 				a_entry.name[0] ? a_entry.name : "<unnamed>");
 		}
 		return true;
+	}
+
+
+	bool RepairDualShadersForTrackedRef(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
+	{
+		if (!a_ref || !LooksPointerish(reinterpret_cast<std::uintptr_t>(a_ref))) {
+			++g_counters.postDoorDualRepairSkipped;
+			return false;
+		}
+		if (a_entry.appliedTier == LootTier::None || a_entry.appliedTier != a_entry.lastDesiredTier) {
+			++g_counters.postDoorDualRepairSkipped;
+			return false;
+		}
+		const auto tier = a_entry.appliedTier;
+		if (!TierSecondaryEnabled(tier) || TierSecondaryShaderFormID(tier) == 0 || TierSecondaryStackCount(tier) == 0) {
+			++g_counters.postDoorDualRepairSkipped;
+			return false;
+		}
+		if (!a_entry.valueGlow.applied || a_entry.valueGlow.activeStacks == 0 || !a_entry.secondaryGlow.applied || a_entry.secondaryGlow.activeStacks == 0) {
+			++g_counters.postDoorDualRepairSkipped;
+			return false;
+		}
+
+		auto* current3D = a_ref->Get3D();
+		if (!current3D) {
+			++g_counters.postDoorDualRepairSkipped;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] post-door dual repair skipped: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, reason=no 3D, name={}",
+					a_entry.ref,
+					a_entry.refFormID,
+					a_entry.baseFormID,
+					TierName(tier),
+					a_entry.name[0] ? a_entry.name : "<unnamed>");
+			}
+			return false;
+		}
+
+		++g_counters.postDoorDualRepairAttempts;
+
+		auto* primaryShader = ResolveTierShader(tier);
+		auto* secondaryShader = ResolveTierSecondaryShader(tier);
+		void* processLists = GetProcessLists();
+		if (!primaryShader || !secondaryShader || !processLists) {
+			++g_counters.postDoorDualRepairFailures;
+			REX::INFO("[LootGlow] post-door dual repair failed: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, primaryShader={:016X}, secondaryShader={:016X}, processLists={:016X}, reason={}, name={}",
+				a_entry.ref,
+				a_entry.refFormID,
+				a_entry.baseFormID,
+				TierName(tier),
+				reinterpret_cast<std::uintptr_t>(primaryShader),
+				reinterpret_cast<std::uintptr_t>(secondaryShader),
+				reinterpret_cast<std::uintptr_t>(processLists),
+				a_reason ? a_reason : "<none>",
+				a_entry.name[0] ? a_entry.name : "<unnamed>");
+			return false;
+		}
+
+		const auto oldPrimaryStacks = a_entry.valueGlow.activeStacks;
+		const auto oldSecondaryStacks = a_entry.secondaryGlow.activeStacks;
+		const auto desiredPrimaryStacks = TierStackCount(tier);
+		const auto desiredSecondaryStacks = TierSecondaryStackCount(tier);
+
+		// Rebuild the full dual pair. Secondary-only repair can restore
+		// the accent, but visual testing showed it can cancel or suppress the lingering
+		// primary. Use the same known-good order as normal tier apply:
+		// finish secondary, finish primary, apply secondary first, apply primary last.
+		FinishTrackedStack(a_ref, secondaryShader, a_entry.secondaryGlow);
+		FinishTrackedStack(a_ref, primaryShader, a_entry.valueGlow);
+		a_entry.secondaryGlow = GlowStackState{};
+		a_entry.valueGlow = GlowStackState{};
+
+		std::uint32_t repairedSecondaryStacks = 0;
+		for (std::uint32_t stackIndex = 0; stackIndex < desiredSecondaryStacks; ++stackIndex) {
+			void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
+			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
+				REX::INFO("[LootGlow] post-door dual repair secondary stack {}/{} failed: ref={:016X}, tier={}", stackIndex + 1, desiredSecondaryStacks, a_entry.ref, TierName(tier));
+				continue;
+			}
+			++repairedSecondaryStacks;
+		}
+
+		std::uint32_t repairedPrimaryStacks = 0;
+		for (std::uint32_t stackIndex = 0; stackIndex < desiredPrimaryStacks; ++stackIndex) {
+			void* effect = ConstructMagicShaderHitEffect(a_ref, primaryShader, -1.0f);
+			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
+				REX::INFO("[LootGlow] post-door dual repair primary stack {}/{} failed: ref={:016X}, tier={}", stackIndex + 1, desiredPrimaryStacks, a_entry.ref, TierName(tier));
+				continue;
+			}
+			++repairedPrimaryStacks;
+		}
+
+		if (repairedPrimaryStacks == 0) {
+			if (repairedSecondaryStacks > 0) {
+				FinishTrackedStack(a_ref, secondaryShader, GlowStackState{ true, repairedSecondaryStacks });
+			}
+			a_entry.appliedTier = LootTier::None;
+			++g_counters.postDoorDualRepairFailures;
+			REX::INFO("[LootGlow] post-door dual repair failed: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, desiredPrimaryStacks={}, desiredSecondaryStacks={}, repairedPrimaryStacks=0, repairedSecondaryStacks={}, reason={}, name={}",
+				a_entry.ref,
+				a_entry.refFormID,
+				a_entry.baseFormID,
+				TierName(tier),
+				oldPrimaryStacks,
+				oldSecondaryStacks,
+				desiredPrimaryStacks,
+				desiredSecondaryStacks,
+				repairedSecondaryStacks,
+				a_reason ? a_reason : "<none>",
+				a_entry.name[0] ? a_entry.name : "<unnamed>");
+			return false;
+		}
+
+		if (repairedSecondaryStacks == 0) {
+			a_entry.appliedTier = tier;
+			a_entry.valueGlow.applied = true;
+			a_entry.valueGlow.activeStacks = repairedPrimaryStacks;
+			a_entry.secondaryGlow = GlowStackState{};
+			a_entry.lastApplyMs = NowMs();
+			++g_counters.postDoorDualRepairFailures;
+			REX::INFO("[LootGlow] post-door dual repair incomplete: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, repairedPrimaryStacks={}/{}, repairedSecondaryStacks=0/{}, reason={}, name={}",
+				a_entry.ref,
+				a_entry.refFormID,
+				a_entry.baseFormID,
+				TierName(tier),
+				oldPrimaryStacks,
+				oldSecondaryStacks,
+				repairedPrimaryStacks,
+				desiredPrimaryStacks,
+				desiredSecondaryStacks,
+				a_reason ? a_reason : "<none>",
+				a_entry.name[0] ? a_entry.name : "<unnamed>");
+			return false;
+		}
+
+		a_entry.appliedTier = tier;
+		a_entry.valueGlow.applied = true;
+		a_entry.valueGlow.activeStacks = repairedPrimaryStacks;
+		a_entry.secondaryGlow.applied = repairedSecondaryStacks > 0;
+		a_entry.secondaryGlow.activeStacks = repairedSecondaryStacks;
+		a_entry.lastApplyMs = NowMs();
+
+		++g_counters.postDoorDualRepairSuccesses;
+		if (g_settings.debugLogging) {
+			REX::INFO("[LootGlow] post-door dual repair applied: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, repairedPrimaryStacks={}/{}, repairedSecondaryStacks={}/{}, current3D={:016X}, reason={}, name={}",
+				a_entry.ref,
+				a_entry.refFormID,
+				a_entry.baseFormID,
+				TierName(tier),
+				oldPrimaryStacks,
+				oldSecondaryStacks,
+				repairedPrimaryStacks,
+				desiredPrimaryStacks,
+				repairedSecondaryStacks,
+				desiredSecondaryStacks,
+				reinterpret_cast<std::uintptr_t>(current3D),
+				a_reason ? a_reason : "<none>",
+				a_entry.name[0] ? a_entry.name : "<unnamed>");
+		}
+		return true;
+	}
+
+	void RepairTrackedDualShadersAfterPlayerDoorArrival(const char* a_reason)
+	{
+		std::uint32_t visited = 0;
+		std::uint32_t attemptedBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairAttempts);
+		std::uint32_t successBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairSuccesses);
+		std::uint32_t failureBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairFailures);
+		std::uint32_t skippedBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairSkipped);
+
+		for (auto& entry : g_trackedRefs) {
+			if (entry.ref == 0) {
+				continue;
+			}
+			++visited;
+			auto* ref = reinterpret_cast<RE::TESObjectREFR*>(entry.ref);
+			RepairDualShadersForTrackedRef(ref, entry, a_reason);
+		}
+
+		if (g_settings.debugLogging) {
+			REX::INFO("[LootGlow] post-door dual repair pass complete: reason={}, transitionSeq={}, visited={}, attempted={}, success={}, failure={}, skipped={}",
+				a_reason ? a_reason : "<none>",
+				g_playerDoorTransitionSeq,
+				visited,
+				static_cast<std::uint32_t>(g_counters.postDoorDualRepairAttempts) - attemptedBefore,
+				static_cast<std::uint32_t>(g_counters.postDoorDualRepairSuccesses) - successBefore,
+				static_cast<std::uint32_t>(g_counters.postDoorDualRepairFailures) - failureBefore,
+				static_cast<std::uint32_t>(g_counters.postDoorDualRepairSkipped) - skippedBefore);
+		}
 	}
 
 	bool RemoveAppliedLockpickGlow(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
@@ -1224,6 +1467,73 @@ namespace LootGlow::TieredLoot
 		return fn(a_container, a_form);
 	}
 
+	// v0.4.1AE fix: materialize leveled-list contents before any classification.
+	// 1.512.105.0: FUN_14663D620 / RVA 0x0663D620 = GetOrCreateInventoryChanges(TESObjectREFR*).
+	// 1.512.105.0: FUN_146641AC0 / RVA 0x06641AC0 = materialize missing TESLevItem results into InventoryChanges.
+	// The materializer appears idempotent because generated entries are tagged with ExtraData type 0x36
+	// containing the source leveled-list index.
+	using GetOrCreateInventoryChangesFn = RE::InventoryChanges* (*)(RE::TESObjectREFR*);
+	using MaterializeLeveledContentsFn = void (*)(RE::InventoryChanges*);
+
+	RE::InventoryChanges* GetOrCreateInventoryChanges(RE::TESObjectREFR* a_ref)
+	{
+		if (!a_ref) {
+			return nullptr;
+		}
+		REL::Relocation<GetOrCreateInventoryChangesFn> fn{ REL::Offset(0x0663D620) };
+		return fn(a_ref);
+	}
+
+	void MaterializeLeveledContents(RE::InventoryChanges* a_changes)
+	{
+		if (!a_changes) {
+			return;
+		}
+		REL::Relocation<MaterializeLeveledContentsFn> fn{ REL::Offset(0x06641AC0) };
+		fn(a_changes);
+	}
+
+	bool IsProbablyTESLevItem(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return false;
+		}
+		// Ghidra shows TESLevItem checks in this inventory cluster as *(char*)(form + 0x08) == '+'.
+		// This avoids requiring a TESLevItem header that may not exist in CommonLibOB64.
+		const auto addr = reinterpret_cast<std::uintptr_t>(a_form);
+		return *reinterpret_cast<const char*>(addr + 0x08) == '+';
+	}
+
+	std::uint32_t CountBaseLeveledEntries(RE::TESContainer* a_container)
+	{
+		if (!a_container) {
+			return 0;
+		}
+		std::uint32_t count = 0;
+		for (auto it = a_container->objectList.begin(); it != a_container->objectList.end(); ++it) {
+			auto* obj = reinterpret_cast<RE::ContainerObject*>(*it);
+			if (obj && obj->type && IsProbablyTESLevItem(obj->type)) {
+				++count;
+			}
+		}
+		return count;
+	}
+
+	std::uint32_t CountRuntimeChangeEntries(RE::InventoryChanges* a_changes)
+	{
+		if (!a_changes || !a_changes->list) {
+			return 0;
+		}
+		std::uint32_t count = 0;
+		for (auto it = a_changes->list->begin(); it != a_changes->list->end(); ++it) {
+			if (*it) {
+				++count;
+			}
+		}
+		return count;
+	}
+
+
 	std::uint32_t GetFormID(RE::TESForm* a_form)
 	{
 		return a_form ? static_cast<std::uint32_t>(a_form->GetFormID()) : 0;
@@ -1296,6 +1606,92 @@ namespace LootGlow::TieredLoot
 		return {};
 	}
 
+#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
+	ItemValueResult TryReadTESValueFormValue(RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return {};
+		}
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* valueForm = dynamic_cast<RE::TESValueForm*>(a_form);
+			if (valueForm) {
+				if constexpr (HasValueMember<RE::TESValueForm>::value) {
+					return { true, static_cast<std::uint32_t>(valueForm->value) };
+				}
+			}
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return {};
+		}
+#endif
+		return {};
+	}
+#endif
+
+	ItemValueResult TryReadIngredientItemValue(RE::TESForm* a_form)
+	{
+#if LOOTGLOW_HAS_INGREDIENTITEM_HEADER
+		if (!a_form) {
+			return {};
+		}
+		auto* ingredient = a_form->As<RE::IngredientItem>();
+		if (!ingredient) {
+			return {};
+		}
+
+		// IngredientItem is not a TESValueForm in current CommonLibOB64.
+		// It derives through MagicItemObject and stores its player-facing value in
+		// IngredientItemData::costOverride. Prefer MagicItem::GetCost when available,
+		// then fall back to the concrete data field.
+#if LOOTGLOW_HAS_MAGICITEM_HEADER
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* magicItem = dynamic_cast<RE::MagicItem*>(ingredient);
+			if (magicItem) {
+				const auto cost = magicItem->GetCost(nullptr);
+				if (cost > 0.0F) {
+					return { true, static_cast<std::uint32_t>(cost + 0.5F) };
+				}
+			}
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return {};
+		}
+#endif
+#endif
+
+		if (ingredient->data.costOverride > 0) {
+			return { true, static_cast<std::uint32_t>(ingredient->data.costOverride) };
+		}
+
+		if (auto value = TryReadValueAs<RE::IngredientItem>(a_form); value.available) {
+			return value;
+		}
+#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
+#if defined(_MSC_VER)
+		__try {
+#endif
+			auto* valueForm = dynamic_cast<RE::TESValueForm*>(ingredient);
+			if (valueForm) {
+				if constexpr (HasValueMember<RE::TESValueForm>::value) {
+					return { true, static_cast<std::uint32_t>(valueForm->value) };
+				}
+			}
+#if defined(_MSC_VER)
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return {};
+		}
+#endif
+#endif
+#else
+		(void)a_form;
+#endif
+		return {};
+	}
+
 	ItemValueResult GetItemBaseGoldValue(RE::TESForm* a_form)
 	{
 		if (!a_form) {
@@ -1303,6 +1699,10 @@ namespace LootGlow::TieredLoot
 		}
 #if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
 		if (auto value = TryReadAlchemyItemValue(a_form); value.available) { return value; }
+#endif
+		if (auto value = TryReadIngredientItemValue(a_form); value.available) { return value; }
+#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
+		if (auto value = TryReadTESValueFormValue(a_form); value.available) { return value; }
 #endif
 #if LOOTGLOW_HAS_TESOBJECTMISC_HEADER
 		if (auto value = TryReadValueAs<RE::TESObjectMISC>(a_form); value.available) { return value; }
@@ -1425,6 +1825,8 @@ namespace LootGlow::TieredLoot
 	{
 		bool baseAvailable{ false };
 		std::uint32_t baseValue{ 0 };
+		bool alchemyItem{ false };
+		bool ingredientItem{ false };
 		bool enchantable{ false };
 		RE::TESFormID enchantmentFormID{ 0 };
 		float magicItemCost{ 0.0F };
@@ -1574,7 +1976,10 @@ namespace LootGlow::TieredLoot
 			return true;
 
 		// Resist-style worn effects. The exact code ordering is still being
-		// validated, but code 66 = Resist Poison is confirmed by v0.4.1F.
+		// validated. v0.4.2C confirms effectCode 53 = Resist Disease
+		// with 20 magnitude on LOC_FN_EnchClothingShirtResistDisease.
+		// v0.4.1F previously confirmed effectCode 66 = Resist Poison.
+		case 53:
 		case 60:
 			a_outRule = { 15.0F, 0, "Resist Disease-style" };
 			return true;
@@ -1687,12 +2092,34 @@ namespace LootGlow::TieredLoot
 	}
 
 
+	bool IsAlchemyItemFormForValue(RE::TESForm* a_form)
+	{
+#if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
+		return a_form && a_form->As<RE::AlchemyItem>() != nullptr;
+#else
+		(void)a_form;
+		return false;
+#endif
+	}
+
+	bool IsIngredientItemFormForValue(RE::TESForm* a_form)
+	{
+#if LOOTGLOW_HAS_INGREDIENTITEM_HEADER
+		return a_form && a_form->As<RE::IngredientItem>() != nullptr;
+#else
+		(void)a_form;
+		return false;
+#endif
+	}
+
 	ItemValueDetails EstimateFullGoldValueDetails(RE::TESForm* a_form)
 	{
 		ItemValueDetails details{};
 		const auto baseValue = GetItemBaseGoldValue(a_form);
 		details.baseAvailable = baseValue.available;
 		details.baseValue = baseValue.value;
+		details.alchemyItem = IsAlchemyItemFormForValue(a_form);
+		details.ingredientItem = IsIngredientItemFormForValue(a_form);
 		if (!baseValue.available) {
 			return details;
 		}
@@ -2295,12 +2722,14 @@ namespace LootGlow::TieredLoot
 			if (auto* rawName = RE::TESFullName::GetFullName(a_form)) {
 				itemName = rawName;
 			}
-			REX::INFO("[LootGlow] item value diagnostic: form={:08X}, count={}, uniqueKnown={}, baseAvailable={}, baseValue={}, enchantable={}, enchantment={:08X}, magicCost={:.2f}, costOverride={:.2f}, charge={}, enchantmentBonus={}, wornEnchantMagnitude={}, wornEnchantEffectCode={}, wornEnchantBarterFactor={:.2f}, wornEnchantBonus={}, fullValueEach={}, stackValue={}, name={}",
+			REX::INFO("[LootGlow] item value diagnostic: form={:08X}, count={}, uniqueKnown={}, baseAvailable={}, baseValue={}, alchemyItem={}, ingredientItem={}, enchantable={}, enchantment={:08X}, magicCost={:.2f}, costOverride={:.2f}, charge={}, enchantmentBonus={}, wornEnchantMagnitude={}, wornEnchantEffectCode={}, wornEnchantBarterFactor={:.2f}, wornEnchantBonus={}, fullValueEach={}, stackValue={}, name={}",
 				GetFormID(a_form),
 				a_count,
 				knownUniqueItem,
 				valueDetails.baseAvailable,
 				valueDetails.baseValue,
+				valueDetails.alchemyItem,
+				valueDetails.ingredientItem,
 				valueDetails.enchantable,
 				static_cast<std::uint32_t>(valueDetails.enchantmentFormID),
 				valueDetails.magicItemCost,
@@ -2334,6 +2763,13 @@ namespace LootGlow::TieredLoot
 		for (auto it = a_container->objectList.begin(); it != a_container->objectList.end(); ++it) {
 			auto* obj = reinterpret_cast<RE::ContainerObject*>(*it);
 			if (!obj || !obj->type) {
+				continue;
+			}
+
+			// TESLevItem base entries are unresolved placeholders, not concrete loot.
+			// v0.4.1AE: never classify a container from the leveled-list placeholder itself;
+			// materialized concrete results are counted later from InventoryChanges.
+			if (IsProbablyTESLevItem(obj->type)) {
 				continue;
 			}
 
@@ -2380,6 +2816,86 @@ namespace LootGlow::TieredLoot
 		return ::TrackContainer(a_ref, objectContainer, name);
 	}
 
+	void MaterializeLeveledContentsBeforeClassification(RE::TESObjectREFR* a_ref, RE::TESContainer* a_container, TrackedRef& a_entry, const char* a_source)
+	{
+		if (!a_ref || !a_container || a_entry.leveledMaterializationDone) {
+			return;
+		}
+
+		const auto baseLeveledEntries = CountBaseLeveledEntries(a_container);
+		if (baseLeveledEntries == 0) {
+			return;
+		}
+
+		// Mark before calling the engine materializer so repeated LoadGraphics/hover passes cannot
+		// stack duplicate work if the engine re-enters this path. FUN_146641AC0 itself also checks
+		// ExtraData 0x36 source indices before generating entries.
+		a_entry.leveledMaterializationDone = true;
+		++g_counters.pendingMaterializeCandidates;
+
+		const auto beforeSummary = ScanContainerValue(a_ref, a_container);
+		auto* beforeChanges = GetInventoryChanges(a_ref);
+		const auto beforeRuntimeEntries = CountRuntimeChangeEntries(beforeChanges);
+		const auto beforeValue = beforeSummary.KnownValueTotal();
+		const auto beforeHighest = beforeSummary.HighestValueCandidate();
+		const auto beforeUnique = beforeSummary.uniqueItems;
+		const auto beforeGold = beforeSummary.goldTotalCount;
+		const auto beforePicks = beforeSummary.lockpickTotalCount;
+
+		auto* changes = GetOrCreateInventoryChanges(a_ref);
+		if (!changes) {
+			++g_counters.pendingMaterializeNoChange;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] leveled-materialize skipped: source={}, GetOrCreateInventoryChanges returned null for ref={:08X}/{:08X}, baseLeveledEntries={}, name={}",
+					a_source ? a_source : "scan",
+					GetFormID(a_ref),
+					a_entry.baseFormID,
+					baseLeveledEntries,
+					a_entry.name[0] ? a_entry.name : "<unnamed>");
+			}
+			return;
+		}
+
+		++g_counters.pendingMaterializeAttempts;
+		MaterializeLeveledContents(changes);
+
+		const auto afterSummary = ScanContainerValue(a_ref, a_container);
+		const auto afterRuntimeEntries = CountRuntimeChangeEntries(GetInventoryChanges(a_ref));
+		const bool changed =
+			afterRuntimeEntries != beforeRuntimeEntries ||
+			afterSummary.KnownValueTotal() != beforeValue ||
+			afterSummary.HighestValueCandidate() != beforeHighest ||
+			afterSummary.uniqueItems != beforeUnique ||
+			afterSummary.goldTotalCount != beforeGold ||
+			afterSummary.lockpickTotalCount != beforePicks;
+
+		if (changed) {
+			++g_counters.pendingMaterializeResolved;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] leveled-materialize before-classify changed: source={}, ref={:08X}/{:08X}, baseLeveledEntries={}, runtimeEntries {}->{}, value {}->{}, highest {}->{}, uniqueItems {}->{}, gold {}->{}, picks {}->{}, name={}",
+					a_source ? a_source : "scan",
+					GetFormID(a_ref),
+					a_entry.baseFormID,
+					baseLeveledEntries,
+					beforeRuntimeEntries,
+					afterRuntimeEntries,
+					beforeValue,
+					afterSummary.KnownValueTotal(),
+					beforeHighest,
+					afterSummary.HighestValueCandidate(),
+					beforeUnique,
+					afterSummary.uniqueItems,
+					beforeGold,
+					afterSummary.goldTotalCount,
+					beforePicks,
+					afterSummary.lockpickTotalCount,
+					a_entry.name[0] ? a_entry.name : "<unnamed>");
+			}
+		} else {
+			++g_counters.pendingMaterializeNoChange;
+		}
+	}
+
 	bool ScanAndApplyTier(RE::TESObjectREFR* a_ref, const char* a_source)
 	{
 		if (!a_ref) {
@@ -2396,6 +2912,11 @@ namespace LootGlow::TieredLoot
 		if (!entry) {
 			return false;
 		}
+
+		// v0.4.1AE: materialize leveled-list contents before the first classification scan.
+		// This prevents LoadGraphics/hover paths from briefly applying a tier based on
+		// unresolved TESLevItem placeholder entries.
+		MaterializeLeveledContentsBeforeClassification(a_ref, container, *entry, a_source);
 
 		const auto summary = ScanContainerValue(a_ref, container);
 		const auto knownValueTotal = summary.KnownValueTotal();
@@ -2504,12 +3025,114 @@ namespace LootGlow::TieredLoot
 
 }
 
+
+struct Hook_PlayerSetParentCell_DualShaderRepair
+{
+	static void SetParentCell(RE::PlayerCharacter* a_player, RE::TESObjectCELL* a_cell)
+	{
+		auto* singleton = RE::PlayerCharacter::GetSingleton();
+		if (a_player != singleton) {
+			SetParentCellHook(a_player, a_cell);
+			return;
+		}
+
+		const auto playerPtr = PtrValue(a_player);
+		const auto oldParentCellPtr = PtrValue(a_player ? a_player->parentCell : nullptr);
+		const bool incomingNull = a_cell == nullptr;
+		const auto current3DBeforePtr = PtrValue(a_player ? a_player->Get3D() : nullptr);
+		const bool travelUseDoorBefore = a_player ? a_player->travelUseDoor : false;
+		const bool transportingBefore = a_player ? a_player->transporting : false;
+		auto* lastDoorBefore = a_player ? a_player->lastDoorActivated : nullptr;
+		auto* pendingDoorBefore = a_player ? a_player->pendingDoorTeleportationInfo.teleportingDoor : nullptr;
+		auto* objectToGetBefore = a_player ? a_player->pendingDoorTeleportationInfo.objectToGet : nullptr;
+		const auto lastDoorBeforePtr = PtrValue(lastDoorBefore);
+		const auto pendingDoorBeforePtr = PtrValue(pendingDoorBefore);
+		const auto lastDoorBeforeForm = lastDoorBefore ? lastDoorBefore->GetFormID() : 0;
+		const auto pendingDoorBeforeForm = pendingDoorBefore ? pendingDoorBefore->GetFormID() : 0;
+		const auto pendingCountBefore = a_player ? a_player->pendingDoorTeleportationInfo.count : 0;
+		const bool pendingBefore = pendingDoorBefore != nullptr || objectToGetBefore != nullptr || pendingCountBefore != 0;
+
+		const bool doorTransitionBegin = incomingNull && (transportingBefore || pendingBefore || lastDoorBefore != nullptr) && current3DBeforePtr != 0;
+		if (doorTransitionBegin && !g_playerDoorTransitionActive) {
+			g_playerDoorTransitionActive = true;
+			++g_playerDoorTransitionSeq;
+			++g_counters.playerDoorTransitionBegins;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] player door transition begin detected: seq={}, player={:016X}, oldParentCell={:016X}, pendingDoor={:016X}/{:08X}, lastDoor={:016X}/{:08X}, transporting={}, travelUseDoor={}, pendingCount={}",
+					g_playerDoorTransitionSeq,
+					playerPtr,
+					oldParentCellPtr,
+					pendingDoorBeforePtr,
+					pendingDoorBeforeForm,
+					lastDoorBeforePtr,
+					lastDoorBeforeForm,
+					transportingBefore ? "true" : "false",
+					travelUseDoorBefore ? "true" : "false",
+					pendingCountBefore);
+			}
+		}
+
+		SetParentCellHook(a_player, a_cell);
+
+		const auto newParentCellPtr = PtrValue(a_player ? a_player->parentCell : nullptr);
+		const auto current3DAfterPtr = PtrValue(a_player ? a_player->Get3D() : nullptr);
+		const bool travelUseDoorAfter = a_player ? a_player->travelUseDoor : false;
+		const bool transportingAfter = a_player ? a_player->transporting : false;
+		auto* lastDoorAfter = a_player ? a_player->lastDoorActivated : nullptr;
+		auto* pendingDoorAfter = a_player ? a_player->pendingDoorTeleportationInfo.teleportingDoor : nullptr;
+		const auto lastDoorAfterPtr = PtrValue(lastDoorAfter);
+		const auto pendingDoorAfterPtr = PtrValue(pendingDoorAfter);
+		const auto lastDoorAfterForm = lastDoorAfter ? lastDoorAfter->GetFormID() : 0;
+		const auto pendingDoorAfterForm = pendingDoorAfter ? pendingDoorAfter->GetFormID() : 0;
+		const auto pendingCountAfter = a_player ? a_player->pendingDoorTeleportationInfo.count : 0;
+
+		if (g_playerDoorTransitionActive && !incomingNull && a_cell != nullptr && newParentCellPtr != 0 && current3DAfterPtr != 0) {
+			++g_counters.playerDoorTransitionArrivals;
+			if (g_settings.debugLogging) {
+				REX::INFO("[LootGlow] player door transition arrival detected: seq={}, player={:016X}, parentCell={:016X}, current3D={:016X}, pendingDoor={:016X}/{:08X}, lastDoor={:016X}/{:08X}, transporting={}, travelUseDoor={}, pendingCount={}",
+					g_playerDoorTransitionSeq,
+					playerPtr,
+					newParentCellPtr,
+					current3DAfterPtr,
+					pendingDoorAfterPtr,
+					pendingDoorAfterForm,
+					lastDoorAfterPtr,
+					lastDoorAfterForm,
+					transportingAfter ? "true" : "false",
+					travelUseDoorAfter ? "true" : "false",
+					pendingCountAfter);
+			}
+			RepairTrackedDualShadersAfterPlayerDoorArrival("player-door-arrival");
+			g_playerDoorTransitionActive = false;
+		}
+
+		MaybeLogStats("player-door-transition");
+	}
+
+	static inline REL::THookVFT SetParentCellHook{
+		RE::PlayerCharacter::VTABLE[0],
+		0x6B,
+		SetParentCell
+	};
+};
+
+
 struct Hook_SetInfoForRef_TieredLoot
 {
-	static bool SetInfoForRef(RE::TESObjectREFR* a_ref, bool a_arg2, bool a_arg3)
+	static bool SetInfoForRef(RE::TESObjectREFR* a_ref)
 	{
-		const bool result = SetInfoForRefHook(a_ref, a_arg2, a_arg3);
+		auto result = SetInfoForRefHook(a_ref);
+		++g_counters.hoverUpdateHits;
+
+		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
+		auto* container = baseObject ? baseObject->As<RE::TESObjectCONT>() : nullptr;
+		if (!container) {
+			return result;
+		}
+
+		++g_counters.hoverUpdateContainers;
 		LootGlow::TieredLoot::ScanAndApplyTier(a_ref, "hover-update");
+		MaybeLogStats("hover-update");
 		return result;
 	}
 
@@ -2520,6 +3143,7 @@ struct Hook_SetInfoForRef_TieredLoot
 		SetInfoForRef
 	};
 };
+
 
 struct Hook_LoadGraphics_TieredLoot
 {
@@ -2559,6 +3183,7 @@ struct Hook_LoadGraphics_TieredLoot
 	};
 };
 
+
 OBSE_PLUGIN_PRELOAD(const OBSE::PreLoadInterface* a_obse)
 {
 	OBSE::Init(a_obse, {
@@ -2577,7 +3202,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 
 	LoadSettings();
 
-	REX::INFO("LootGlow v0.4.1R lockpick refresh cleanup initialized");
+	REX::INFO("LootGlow v0.4.2C initialized");
 	REX::INFO("Tier settings: aggregateMode={}, Unique(enabled={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Low(enabled={}, threshold={}, shader={:08X}, stacks={}), Medium(enabled={}, threshold={}, shader={:08X}, stacks={}), High(enabled={}, threshold={}, shader={:08X}, stacks={}), Insane(enabled={}, threshold={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Lockpick(enabled={}, form={:08X}, shader={:08X}, stacks={})",
 		g_settings.valueAggregateMode,
 		g_settings.uniqueItemMode,
@@ -2611,7 +3236,7 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 		g_settings.lockpickStackCount);
 	REX::INFO("Visual refresh settings: refreshMode={} (0=off, 1=load/graphics defensive refresh)",
 		g_settings.visualRefreshMode);
-	REX::INFO("v0.4.1Q behavior: Unique known-item primary+secondary shaders take priority over monetary tiers and lockpick glow; table-driven worn enchant value rules remain active; flat-cost worn effects include Night-Eye +100 and Water Breathing/Walking +2000; unknown effect codes remain conservative and are logged in DebugItemValues");
+	REX::INFO("v0.4.2 behavior: AE materialize-before-classify plus PlayerCharacter::SetParentCell door-transition detection; on post-door player arrival, performs one event-driven full dual-shader rebuild pass for tracked dual-shader refs with valid 3D. Potion/poison AlchemyItem and IngredientItem values count toward tier thresholds; value diagnostics are available through DebugItemValues.");
 	if (g_settings.debugLogging) {
 		MaybeLogStats("startup", true);
 	}
