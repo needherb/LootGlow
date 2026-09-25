@@ -33,7 +33,15 @@ Simply put, valuable, useful, or unique containers should be easier to notice at
   * Enchanted items
   * Known unique/artifact items
 * Includes defensive visual refresh logic for containers whose graphics load or reload after the initial scan.
-* Includes passive door-transition repair for dual-shader visuals when returning to previously loaded cells.
+* Restores shader stacks for all glow tiers when returning to previously loaded cells.
+
+## Experimental v0.4.2 shader recovery
+
+The optional v0.4.2 build restores full glow intensity after leaving and re-entering a cell. It reinitializes both shaders for Insane and Unique glows, and the stacked shader for Low, Medium, High, and standalone Lockpick glows. Containers still receive their glow automatically as their graphics load.
+
+The included INI enables recovery but leaves `LegacyGlowNormalizationMode=0`. On a save with duplicated LootGlow effects, set it to `1`. The first hover after graphics load then checks for extra matching effects and, when needed, requests removal and rebuilds the current stacks on a later hover. This can affect another mod that applies the same configured shader to the same container. Back up your save before testing this experimental build.
+
+The recovery hooks require the inspected Oblivion Remastered executable 1.512.105.0. An executable fingerprint mismatch causes the hooks to be skipped. See [the experimental release notes](release/0.4.2-experimental.md) for the scope of in-game testing.
 
 ## Requirements
 
@@ -46,7 +54,7 @@ Simply put, valuable, useful, or unique containers should be easier to notice at
 Install with your preferred mod manager, or install manually by placing the files in:
 
 ```text
-Data/OBSE/Plugins/
+OblivionRemastered/Binaries/Win64/OBSE/Plugins/
 ```
 
 The folder should contain:
@@ -75,13 +83,25 @@ AggregateMode=1
 ; 1 = enabled, 0 = disabled
 VisualRefreshMode=1
 
+; Restore full intensity for tracked single-shader glows.
+SingleShaderFullReinitMode=1
+
+; Optional cleanup for saves with duplicated LootGlow effects.
+LegacyGlowNormalizationMode=0
+
+; Restore both shaders and full intensity for dual-shader glows.
+UniqueItemDualReinitMode=1
+UniqueItemFullReinitMode=1
+InsaneTierDualReinitMode=1
+InsaneTierFullReinitMode=1
+
 ; Containers with known unique/artifact items use a special Unique glow.
 ; Unique items take priority over normal value tiers and lockpicks.
 ; 1 = enabled, 0 = disabled
 UniqueItemMode=1
 
 ; Minimum total value needed for each glow tier.
-LowTierThreshold=30
+LowTierThreshold=50
 MediumTierThreshold=100
 HighTierThreshold=300
 InsaneTierThreshold=1000
@@ -122,7 +142,7 @@ LootGlow chooses the highest matching value tier.
 
 With the default settings:
 
-* Containers worth **30+ gold** use the Low tier.
+* Containers worth **50+ gold** use the Low tier.
 * Containers worth **100+ gold** use the Medium tier.
 * Containers worth **300+ gold** use the High tier.
 * Containers worth **1000+ gold** use the Insane tier.
@@ -195,11 +215,11 @@ The default INI intentionally exposes only the most useful settings.
 
 LootGlow also supports additional advanced options for shader tuning and troubleshooting, but they are hidden from the default INI to keep installation simple. Most users should not need to change them.
 
-Advanced users may manually add supported shader FormID, stack count, secondary shader, or debug logging keys if needed for testing or troubleshooting.
+Advanced users may manually add supported shader FormID, stack count, secondary shader, or debug logging keys if needed for testing or troubleshooting. The experimental build also supports the recovery and normalization settings described above.
 
 ## Troubleshooting
 
-If containers do not appear to glow immediately, try leaving and re-entering the area or saving and reloading.
+If containers do not appear to glow immediately, try leaving and re-entering the area or saving and reloading. On an existing save with duplicated or overly bright glow, try `LegacyGlowNormalizationMode=1` and hover over the affected container after its graphics load.
 
 LootGlow includes defensive refresh logic, but Oblivion Remastered can sometimes delay or reuse container graphics and inventory data while moving between cells.
 
@@ -225,15 +245,15 @@ The development build environment used for release builds included:
 Typical build commands from the project root:
 
 ```powershell
-xmake f -c
-xmake
+git submodule update --init --recursive
+xmake build -y LootGlow
 ```
 
 Build artifacts are not intended to be committed directly to this repository. Release DLLs should be distributed through GitHub Releases and/or a mod hosting site.
 
 ## Repository Layout
 
-Suggested source repository layout:
+Source repository layout:
 
 ```text
 LootGlow/
@@ -242,7 +262,15 @@ LootGlow/
 ├─ LootGlow.ini
 ├─ xmake.lua
 ├─ src/
-│  └─ main.cpp
+│  ├─ main.cpp
+│  ├─ pch.h
+│  └─ recovery_effect_list.h
+├─ tests/
+│  └─ recovery_effect_list_tests.cpp
+├─ lib/
+│  └─ commonlibob64/ (submodule)
+├─ release/
+│  └─ 0.4.2-experimental.md
 └─ docs/
    └─ THIRD_PARTY_NOTICES.md
 ```

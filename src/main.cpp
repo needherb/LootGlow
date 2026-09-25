@@ -1,8 +1,11 @@
 #if defined(_MSC_VER)
 #	include <excpt.h>
+#	include <intrin.h>
 #endif
 
+#include <algorithm>
 #include <array>
+#include "recovery_effect_list.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -10,17 +13,10 @@
 #include <cstring>
 #include <cmath>
 #include <string_view>
-#include <type_traits>
 
 #include <Windows.h>
 
 #include "RE/T/TESFullName.h"
-#if __has_include("RE/T/TESValueForm.h")
-#	include "RE/T/TESValueForm.h"
-#	define LOOTGLOW_HAS_TESVALUEFORM_HEADER 1
-#else
-#	define LOOTGLOW_HAS_TESVALUEFORM_HEADER 0
-#endif
 #if __has_include("RE/T/TESObjectMISC.h")
 #	include "RE/T/TESObjectMISC.h"
 #	define LOOTGLOW_HAS_TESOBJECTMISC_HEADER 1
@@ -113,11 +109,10 @@
 #endif
 #include "RE/T/TESObjectCONT.h"
 #include "RE/T/TESObjectREFR.h"
-#include "RE/P/PlayerCharacter.h"
 
 namespace
 {
-	// v0.4.2: four value tiers plus one special Unique-item shader category.
+	// v0.4.1O: four value tiers plus one special Unique-item shader category.
 	//
 	// This file intentionally drops the old independent gold/high-value/lockpick
 	// visual state machine. A scan computes one desired visual plan, then all owned
@@ -145,10 +140,10 @@ namespace
 	constexpr RE::TESFormID kDefaultUniqueItemShaderFormID = 0x000852FE;  // Unique/artifact primary shader default
 	constexpr RE::TESFormID kDefaultUniqueItemSecondaryShaderFormID = 0x0018B579;  // Unique/artifact secondary accent shader default
 	constexpr RE::TESFormID kDefaultLockpickShaderFormID = 0x0014A0A2;    // STRP / purple Soul Trap hit effect
-	constexpr std::uint32_t kDefaultLowTierThreshold = 10;
+	constexpr std::uint32_t kDefaultLowTierThreshold = 25;
 	constexpr std::uint32_t kDefaultMediumTierThreshold = 100;
-	constexpr std::uint32_t kDefaultHighTierThreshold = 300;
-	constexpr std::uint32_t kDefaultInsaneTierThreshold = 1000;
+	constexpr std::uint32_t kDefaultHighTierThreshold = 250;
+	constexpr std::uint32_t kDefaultInsaneTierThreshold = 500;
 	constexpr std::uint32_t kDefaultLowTierStackCount = 4;
 	constexpr std::uint32_t kDefaultMediumTierStackCount = 8;
 	constexpr std::uint32_t kDefaultHighTierStackCount = 4;
@@ -174,8 +169,11 @@ namespace
 		RE::TESFormID goldFormID{ kDefaultGoldFormID };
 		bool valueAggregateMode{ true };
 		bool debugLogging{ false };
-		bool debugItemValues{ false };
 		bool visualRefreshMode{ true };
+		// Opt-in intensity recovery for tracked one-shader glows with multiple stacks.
+		bool singleShaderFullReinitMode{ false };
+		// Opt-in migration pass for effects saved by an earlier LootGlow session.
+		bool legacyGlowNormalizationMode{ false };
 		bool lockpickMode{ true };
 		RE::TESFormID lockpickFormID{ kDefaultLockpickFormID };
 		RE::TESFormID lockpickShaderFormID{ kDefaultLockpickShaderFormID };
@@ -185,6 +183,8 @@ namespace
 		RE::TESFormID uniqueItemShaderFormID{ kDefaultUniqueItemShaderFormID };
 		std::uint32_t uniqueItemStackCount{ kDefaultUniqueItemStackCount };
 		bool uniqueItemSecondaryEnabled{ true };
+		bool uniqueItemDualReinitMode{ false };  // Opt-in recovery for tracked Unique refs with both glows.
+		bool uniqueItemFullReinitMode{ false };  // Full-stack reload; requires Unique dual recovery.
 		RE::TESFormID uniqueItemSecondaryShaderFormID{ kDefaultUniqueItemSecondaryShaderFormID };
 		std::uint32_t uniqueItemSecondaryStackCount{ kDefaultUniqueItemSecondaryStackCount };
 
@@ -208,6 +208,8 @@ namespace
 		RE::TESFormID insaneTierShaderFormID{ kDefaultInsaneTierShaderFormID };
 		std::uint32_t insaneTierStackCount{ kDefaultInsaneTierStackCount };
 		bool insaneTierSecondaryEnabled{ true };
+		bool insaneTierDualReinitMode{ false };  // Opt-in recovery for tracked Insane refs with both glows.
+		bool insaneTierFullReinitMode{ false };  // Opt-in full-stack reload; requires Insane dual recovery.
 		RE::TESFormID insaneTierSecondaryShaderFormID{ kDefaultInsaneTierSecondaryShaderFormID };
 		std::uint32_t insaneTierSecondaryStackCount{ kDefaultInsaneTierSecondaryStackCount };
 	};
@@ -239,6 +241,8 @@ namespace
 		GlowStackState lockpickGlow{};
 		LootTier appliedTier{ LootTier::None };
 		bool appliedLockpickGlow{ false };
+		bool legacyNormalizationCheckNeeded{ false };
+		bool legacyNormalizationPending{ false };
 		LootTier lastDesiredTier{ LootTier::None };
 		bool lastDesiredLockpickGlow{ false };
 		bool hasScanned{ false };
@@ -248,25 +252,12 @@ namespace
 		std::int32_t lastLockpickTotalCount{ -1 };
 		std::uint64_t lastApplyMs{ 0 };
 		std::uint64_t lastLoadRefreshMs{ 0 };
-		bool leveledMaterializationDone{ false };
 		char name[96]{};
 	};
 
 	struct Counters
 	{
 		std::uint64_t loadGraphicsHits{ 0 };
-		std::uint64_t loadGraphicsTrackedNew{ 0 };
-		std::uint64_t loadGraphicsTrackedExisting{ 0 };
-		std::uint64_t hoverUpdateHits{ 0 };
-		std::uint64_t hoverUpdateContainers{ 0 };
-		std::uint64_t hoverUpdateTrackedBefore{ 0 };
-		std::uint64_t hoverUpdateTrackedAfter{ 0 };
-		std::uint64_t playerDoorTransitionBegins{ 0 };
-		std::uint64_t playerDoorTransitionArrivals{ 0 };
-		std::uint64_t postDoorDualRepairAttempts{ 0 };
-		std::uint64_t postDoorDualRepairSuccesses{ 0 };
-		std::uint64_t postDoorDualRepairFailures{ 0 };
-		std::uint64_t postDoorDualRepairSkipped{ 0 };
 		std::uint64_t containerLoadHits{ 0 };
 		std::uint64_t trackedContainers{ 0 };
 		std::uint64_t scanCalls{ 0 };
@@ -285,10 +276,6 @@ namespace
 		std::uint64_t removeSuccesses{ 0 };
 		std::uint64_t skippedNoChange{ 0 };
 		std::uint64_t visualRefreshes{ 0 };
-		std::uint64_t pendingMaterializeCandidates{ 0 };
-		std::uint64_t pendingMaterializeAttempts{ 0 };
-		std::uint64_t pendingMaterializeResolved{ 0 };
-		std::uint64_t pendingMaterializeNoChange{ 0 };
 		std::uint64_t shaderResolveFailures{ 0 };
 		std::uint64_t trackingTableFull{ 0 };
 		std::uint64_t pointerReuseResets{ 0 };
@@ -310,8 +297,6 @@ namespace
 	static std::uint64_t g_lastStatsTrackedContainers{ 0 };
 	static std::uint64_t g_lastStatsApplySuccesses{ 0 };
 	static std::uint64_t g_lastStatsRemoveSuccesses{ 0 };
-	static bool g_playerDoorTransitionActive{ false };
-	static std::uint64_t g_playerDoorTransitionSeq{ 0 };
 
 	const char* TierName(LootTier a_tier)
 	{
@@ -329,11 +314,6 @@ namespace
 		default:
 			return "None";
 		}
-	}
-
-	std::uintptr_t PtrValue(const void* a_ptr)
-	{
-		return reinterpret_cast<std::uintptr_t>(a_ptr);
 	}
 
 	std::uint32_t ClampStackCount(std::uint32_t a_value)
@@ -373,8 +353,9 @@ namespace
 		const auto aggregateModeDefault = GetPrivateProfileIntA("LootGlow", "ValueAggregateMode", GetPrivateProfileIntA("LootGlow", "HighValueAggregateMode", 1, a_path), a_path);
 		g_settings.valueAggregateMode = GetPrivateProfileIntA("LootGlow", "AggregateMode", aggregateModeDefault, a_path) != 0;
 		g_settings.debugLogging = GetPrivateProfileIntA("LootGlow", "DebugLogging", 0, a_path) != 0;
-		g_settings.debugItemValues = GetPrivateProfileIntA("LootGlow", "DebugItemValues", 0, a_path) != 0;
 		g_settings.visualRefreshMode = GetPrivateProfileIntA("LootGlow", "VisualRefreshMode", 1, a_path) != 0;
+		g_settings.singleShaderFullReinitMode = GetPrivateProfileIntA("LootGlow", "SingleShaderFullReinitMode", 0, a_path) != 0;
+		g_settings.legacyGlowNormalizationMode = GetPrivateProfileIntA("LootGlow", "LegacyGlowNormalizationMode", 0, a_path) != 0;
 
 		g_settings.lockpickMode = GetPrivateProfileIntA("LootGlow", "LockpickMode", 1, a_path) != 0;
 		g_settings.lockpickFormID = ReadHexFormIDSetting(a_path, "LockpickFormID", kDefaultLockpickFormID);
@@ -385,6 +366,8 @@ namespace
 		g_settings.uniqueItemShaderFormID = ReadHexFormIDSetting(a_path, "UniqueItemShaderFormID", kDefaultUniqueItemShaderFormID);
 		g_settings.uniqueItemStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "UniqueItemStackCount", kDefaultUniqueItemStackCount));
 		g_settings.uniqueItemSecondaryEnabled = GetPrivateProfileIntA("LootGlow", "UniqueItemSecondaryMode", 1, a_path) != 0;
+		g_settings.uniqueItemDualReinitMode = GetPrivateProfileIntA("LootGlow", "UniqueItemDualReinitMode", 0, a_path) != 0;
+		g_settings.uniqueItemFullReinitMode = GetPrivateProfileIntA("LootGlow", "UniqueItemFullReinitMode", 0, a_path) != 0;
 		g_settings.uniqueItemSecondaryShaderFormID = ReadHexFormIDSetting(a_path, "UniqueItemSecondaryShaderFormID", kDefaultUniqueItemSecondaryShaderFormID);
 		g_settings.uniqueItemSecondaryStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "UniqueItemSecondaryStackCount", kDefaultUniqueItemSecondaryStackCount));
 
@@ -415,6 +398,8 @@ namespace
 		g_settings.insaneTierShaderFormID = ReadHexFormIDSetting(a_path, "InsaneTierShaderFormID", kDefaultInsaneTierShaderFormID);
 		g_settings.insaneTierStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "InsaneTierStackCount", kDefaultInsaneTierStackCount));
 		g_settings.insaneTierSecondaryEnabled = GetPrivateProfileIntA("LootGlow", "InsaneTierSecondaryMode", 1, a_path) != 0;
+		g_settings.insaneTierDualReinitMode = GetPrivateProfileIntA("LootGlow", "InsaneTierDualReinitMode", 0, a_path) != 0;
+		g_settings.insaneTierFullReinitMode = GetPrivateProfileIntA("LootGlow", "InsaneTierFullReinitMode", 0, a_path) != 0;
 		g_settings.insaneTierSecondaryShaderFormID = ReadHexFormIDSetting(a_path, "InsaneTierSecondaryShaderFormID", kDefaultInsaneTierSecondaryShaderFormID);
 		g_settings.insaneTierSecondaryStackCount = ClampStackCount(ReadPositiveIntSetting(a_path, "InsaneTierSecondaryStackCount", kDefaultInsaneTierSecondaryStackCount));
 
@@ -735,6 +720,50 @@ namespace
 		return fn();
 	}
 
+
+	// Exact game-build layout guard for native recovery hooks.
+	// Timestamp is compared as an opaque PE build identifier, not a calendar date.
+	static bool g_recoveryLayoutReady = false;
+	static std::uintptr_t g_effectVtable = 0;
+
+	bool CopyGameMemory(std::uint64_t address, void* output, std::size_t size)
+	{
+		constexpr std::uint64_t limit = 0x0000800000000000ULL;
+        if (output == nullptr || size == 0 || address < 0x10000 ||
+            address >= limit || size > limit - address) return false;
+		SIZE_T copied = 0;
+		return ::ReadProcessMemory(::GetCurrentProcess(),
+			reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), output, size, &copied) != 0 && copied == size;
+	}
+
+	void InitializeRecoveryLayout()
+	{
+		// Recovery hooks require this exact-build guard.
+		const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+		IMAGE_DOS_HEADER dos{};
+		IMAGE_NT_HEADERS64 nt{};
+		if (!CopyGameMemory(base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+			dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000 ||
+			!CopyGameMemory(base + static_cast<std::uintptr_t>(dos.e_lfanew), &nt, sizeof(nt)) ||
+			nt.Signature != IMAGE_NT_SIGNATURE) {
+			REX::INFO("LootGlow recovery disabled: executable headers unavailable");
+			return;
+		}
+		const bool fingerprint = nt.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+			nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+			nt.FileHeader.TimeDateStamp == 0xF19077A4u && nt.OptionalHeader.SizeOfImage == 0x09E1E000u &&
+			nt.OptionalHeader.CheckSum == 0x09943C09u;
+		// The 26-slot table belongs to the BSTempEffect subobject (complete object +0x18).
+		const auto table = base + 0x086611A8;
+		std::uintptr_t typeFn = 0, updateFn = 0;
+		g_recoveryLayoutReady = fingerprint &&
+			CopyGameMemory(table + 8, &typeFn, sizeof(typeFn)) && typeFn == base + 0x068AB980 &&
+			CopyGameMemory(table + 20 * 8, &updateFn, sizeof(updateFn)) && updateFn == base + 0x068AC260;
+		if (g_recoveryLayoutReady) g_effectVtable = table;
+		REX::INFO("LootGlow recovery layout: ready={}, timestamp={:08X}, imageSize={:08X}, checksum={:08X}, table={:016X}; exact inspected build only",
+			g_recoveryLayoutReady, nt.FileHeader.TimeDateStamp, nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.CheckSum, table);
+	}
+
 	void AddRefBSTempEffect(std::uintptr_t a_tempEffect)
 	{
 		if (!LooksPointerish(a_tempEffect)) {
@@ -793,28 +822,23 @@ namespace
 #endif
 	}
 
-	void FinishMagicShaderHitEffect(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader)
+	bool FinishMagicShaderHitEffect(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader)
 	{
 		void* processLists = GetProcessLists();
 		if (!processLists || !a_ref || !a_shader) {
-			return;
+			return false;
 		}
 		REL::Relocation<FinishMagicShaderHitEffectFn> fn{ REL::ID(410207) };  // 1.512.105.0: 146741E60
 		fn(processLists, a_ref, a_shader);
+		return true; // Request issued; native cleanup completes later.
 	}
 
-	void FinishTrackedStack(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader, const GlowStackState& a_state)
+	bool FinishTrackedStack(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader, const GlowStackState& a_state)
 	{
-		if (!a_ref || !a_shader || !a_state.applied) {
-			return;
-		}
-		auto attempts = a_state.activeStacks > 0 ? a_state.activeStacks : 1u;
-		if (attempts > kMaxGlowStackCount) {
-			attempts = kMaxGlowStackCount;
-		}
-		for (std::uint32_t i = 0; i < attempts; ++i) {
-			FinishMagicShaderHitEffect(a_ref, a_shader);
-		}
+		if (!a_state.applied) return true;
+		// Native 146741E60 already marks ALL matching target+shader effects.
+		// Repeating the call for each recorded stack does not finish them sooner.
+		return FinishMagicShaderHitEffect(a_ref, a_shader);
 	}
 
 	TrackedRef* FindTrackedRef(std::uintptr_t a_ref)
@@ -875,15 +899,13 @@ namespace
 		}
 
 		g_lastStatsLogMs = now;
-		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, hover={}/{}, scans={}, tiers={}/{}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, removes={}, skipped={}, refreshes={}, matFix={}/{}/{}/{}, shaderFails={}, tableFull={}, reuseResets={}, playerDoorTransitions={}/{}, postDoorDualRepair={}/{}/{}/skipped:{}",
+		REX::INFO("[LootGlow] summary reason={}, tracked={}/{}, glowing={}, loads={}/{}, scans={}, tiers={}/{}/{}/{}/{}/{}, lockpick={}, rebuilds={}, applies={}/{}, finishRequests={}, skipped={}, refreshes={}, shaderFails={}, tableFull={}, reuseResets={}",
 			a_reason ? a_reason : "stats",
 			CountTrackedRefs(),
 			kMaxTrackedRefs,
 			CountGlowingRefs(),
 			g_counters.loadGraphicsHits,
 			g_counters.containerLoadHits,
-			g_counters.hoverUpdateHits,
-			g_counters.hoverUpdateContainers,
 			g_counters.scanCalls,
 			g_counters.tierNone,
 			g_counters.tierUnique,
@@ -898,21 +920,10 @@ namespace
 			g_counters.removeSuccesses,
 			g_counters.skippedNoChange,
 			g_counters.visualRefreshes,
-			g_counters.pendingMaterializeCandidates,
-			g_counters.pendingMaterializeAttempts,
-			g_counters.pendingMaterializeResolved,
-			g_counters.pendingMaterializeNoChange,
 			g_counters.shaderResolveFailures,
 			g_counters.trackingTableFull,
-			g_counters.pointerReuseResets,
-			g_counters.playerDoorTransitionBegins,
-			g_counters.playerDoorTransitionArrivals,
-			g_counters.postDoorDualRepairSuccesses,
-			g_counters.postDoorDualRepairAttempts,
-			g_counters.postDoorDualRepairFailures,
-			g_counters.postDoorDualRepairSkipped);
+			g_counters.pointerReuseResets);
 	}
-
 
 	TrackedRef* TrackContainer(RE::TESObjectREFR* a_ref, RE::TESObjectCONT* a_container, std::string_view a_name)
 	{
@@ -970,19 +981,20 @@ namespace
 		const auto oldTier = a_entry.appliedTier;
 		const auto oldStacks = a_entry.valueGlow.activeStacks;
 		const auto oldSecondaryStacks = a_entry.secondaryGlow.activeStacks;
-		FinishTrackedStack(a_ref, shader, a_entry.valueGlow);
-		if (a_entry.secondaryGlow.applied) {
-			if (auto* secondaryShader = ResolveTierSecondaryShader(oldTier)) {
-				FinishTrackedStack(a_ref, secondaryShader, a_entry.secondaryGlow);
-			}
-		}
+		auto* secondaryShader = a_entry.secondaryGlow.applied ? ResolveTierSecondaryShader(oldTier) : nullptr;
+		// Resolve both before issuing requests; retain tracking on failure.
+		if (a_entry.secondaryGlow.applied && !secondaryShader) return false;
+		if (!FinishTrackedStack(a_ref, shader, a_entry.valueGlow)) return false;
+		if (a_entry.secondaryGlow.applied && secondaryShader != shader &&
+			!FinishTrackedStack(a_ref, secondaryShader, a_entry.secondaryGlow)) return false;
+
 		a_entry.valueGlow = GlowStackState{};
 		a_entry.secondaryGlow = GlowStackState{};
 		a_entry.appliedTier = LootTier::None;
 		++g_counters.removeSuccesses;
 
 		if (g_settings.debugLogging) {
-			REX::INFO("[LootGlow] value glow removed: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, primaryStacks={}, secondaryStacks={}, reason={}, name={}",
+			REX::INFO("[LootGlow] value glow finish requested: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, primaryStacks={}, secondaryStacks={}, reason={}, name={}",
 				a_entry.ref,
 				a_entry.refFormID,
 				a_entry.baseFormID,
@@ -1019,29 +1031,23 @@ namespace
 		std::uint32_t secondaryStackSuccesses = 0;
 		a_entry.valueGlow = GlowStackState{};
 		a_entry.secondaryGlow = GlowStackState{};
+		RE::TESEffectShader* appliedSecondaryShader = nullptr;
+		const auto applySecondary = [&]() {
+			if (!TierSecondaryEnabled(a_tier)) return;
+			appliedSecondaryShader = ResolveTierSecondaryShader(a_tier);
+			if (!appliedSecondaryShader) return;
+			const auto secondaryStackCount = TierSecondaryStackCount(a_tier);
+			for (std::uint32_t stackIndex = 0; stackIndex < secondaryStackCount; ++stackIndex) {
+				void* effect = ConstructMagicShaderHitEffect(a_ref, appliedSecondaryShader, -1.0f);
+				if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
+					REX::INFO("LootGlow {} secondary tier stack {}/{} failed for ref={:016X}", TierName(a_tier), stackIndex + 1, secondaryStackCount, a_entry.ref);
+					continue;
+				}
+				++secondaryStackSuccesses;
+			}
+		};
 
 		++g_counters.applyAttempts;
-
-		// v0.4.1Y dual-shader order fix:
-		// Apply secondary/accent stacks first, then apply the primary tier shader last.
-		// The engine's final visible shader can be order-sensitive; applying the primary
-		// last preserves the tier's main visual while retaining the secondary accent.
-		RE::TESEffectShader* secondaryShader = nullptr;
-		const auto secondaryStackCount = TierSecondaryEnabled(a_tier) ? TierSecondaryStackCount(a_tier) : 0u;
-		if (TierSecondaryEnabled(a_tier)) {
-			secondaryShader = ResolveTierSecondaryShader(a_tier);
-			if (secondaryShader) {
-				for (std::uint32_t stackIndex = 0; stackIndex < secondaryStackCount; ++stackIndex) {
-					void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
-					if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-						REX::INFO("LootGlow {} secondary tier stack {}/{} failed for ref={:016X}", TierName(a_tier), stackIndex + 1, secondaryStackCount, a_entry.ref);
-						continue;
-					}
-					++secondaryStackSuccesses;
-				}
-			}
-		}
-
 		for (std::uint32_t stackIndex = 0; stackIndex < stackCount; ++stackIndex) {
 			void* effect = ConstructMagicShaderHitEffect(a_ref, shader, -1.0f);
 			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
@@ -1052,12 +1058,13 @@ namespace
 		}
 
 		if (stackSuccesses == 0) {
-			if (secondaryShader && secondaryStackSuccesses > 0) {
-				FinishTrackedStack(a_ref, secondaryShader, GlowStackState{ true, secondaryStackSuccesses });
-			}
+			if (secondaryStackSuccesses && appliedSecondaryShader)
+				FinishMagicShaderHitEffect(a_ref, appliedSecondaryShader);
 			++g_counters.applyFailures;
 			return false;
 		}
+
+		applySecondary();
 
 		a_entry.valueGlow.applied = true;
 		a_entry.valueGlow.activeStacks = stackSuccesses;
@@ -1084,194 +1091,6 @@ namespace
 		return true;
 	}
 
-
-	bool RepairDualShadersForTrackedRef(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
-	{
-		if (!a_ref || !LooksPointerish(reinterpret_cast<std::uintptr_t>(a_ref))) {
-			++g_counters.postDoorDualRepairSkipped;
-			return false;
-		}
-		if (a_entry.appliedTier == LootTier::None || a_entry.appliedTier != a_entry.lastDesiredTier) {
-			++g_counters.postDoorDualRepairSkipped;
-			return false;
-		}
-		const auto tier = a_entry.appliedTier;
-		if (!TierSecondaryEnabled(tier) || TierSecondaryShaderFormID(tier) == 0 || TierSecondaryStackCount(tier) == 0) {
-			++g_counters.postDoorDualRepairSkipped;
-			return false;
-		}
-		if (!a_entry.valueGlow.applied || a_entry.valueGlow.activeStacks == 0 || !a_entry.secondaryGlow.applied || a_entry.secondaryGlow.activeStacks == 0) {
-			++g_counters.postDoorDualRepairSkipped;
-			return false;
-		}
-
-		auto* current3D = a_ref->Get3D();
-		if (!current3D) {
-			++g_counters.postDoorDualRepairSkipped;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] post-door dual repair skipped: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, reason=no 3D, name={}",
-					a_entry.ref,
-					a_entry.refFormID,
-					a_entry.baseFormID,
-					TierName(tier),
-					a_entry.name[0] ? a_entry.name : "<unnamed>");
-			}
-			return false;
-		}
-
-		++g_counters.postDoorDualRepairAttempts;
-
-		auto* primaryShader = ResolveTierShader(tier);
-		auto* secondaryShader = ResolveTierSecondaryShader(tier);
-		void* processLists = GetProcessLists();
-		if (!primaryShader || !secondaryShader || !processLists) {
-			++g_counters.postDoorDualRepairFailures;
-			REX::INFO("[LootGlow] post-door dual repair failed: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, primaryShader={:016X}, secondaryShader={:016X}, processLists={:016X}, reason={}, name={}",
-				a_entry.ref,
-				a_entry.refFormID,
-				a_entry.baseFormID,
-				TierName(tier),
-				reinterpret_cast<std::uintptr_t>(primaryShader),
-				reinterpret_cast<std::uintptr_t>(secondaryShader),
-				reinterpret_cast<std::uintptr_t>(processLists),
-				a_reason ? a_reason : "<none>",
-				a_entry.name[0] ? a_entry.name : "<unnamed>");
-			return false;
-		}
-
-		const auto oldPrimaryStacks = a_entry.valueGlow.activeStacks;
-		const auto oldSecondaryStacks = a_entry.secondaryGlow.activeStacks;
-		const auto desiredPrimaryStacks = TierStackCount(tier);
-		const auto desiredSecondaryStacks = TierSecondaryStackCount(tier);
-
-		// Rebuild the full dual pair. Secondary-only repair can restore
-		// the accent, but visual testing showed it can cancel or suppress the lingering
-		// primary. Use the same known-good order as normal tier apply:
-		// finish secondary, finish primary, apply secondary first, apply primary last.
-		FinishTrackedStack(a_ref, secondaryShader, a_entry.secondaryGlow);
-		FinishTrackedStack(a_ref, primaryShader, a_entry.valueGlow);
-		a_entry.secondaryGlow = GlowStackState{};
-		a_entry.valueGlow = GlowStackState{};
-
-		std::uint32_t repairedSecondaryStacks = 0;
-		for (std::uint32_t stackIndex = 0; stackIndex < desiredSecondaryStacks; ++stackIndex) {
-			void* effect = ConstructMagicShaderHitEffect(a_ref, secondaryShader, -1.0f);
-			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-				REX::INFO("[LootGlow] post-door dual repair secondary stack {}/{} failed: ref={:016X}, tier={}", stackIndex + 1, desiredSecondaryStacks, a_entry.ref, TierName(tier));
-				continue;
-			}
-			++repairedSecondaryStacks;
-		}
-
-		std::uint32_t repairedPrimaryStacks = 0;
-		for (std::uint32_t stackIndex = 0; stackIndex < desiredPrimaryStacks; ++stackIndex) {
-			void* effect = ConstructMagicShaderHitEffect(a_ref, primaryShader, -1.0f);
-			if (!effect || !InitMagicShaderHitEffect(effect) || !EmplaceFrontMagicEffectListPO3(processLists, effect)) {
-				REX::INFO("[LootGlow] post-door dual repair primary stack {}/{} failed: ref={:016X}, tier={}", stackIndex + 1, desiredPrimaryStacks, a_entry.ref, TierName(tier));
-				continue;
-			}
-			++repairedPrimaryStacks;
-		}
-
-		if (repairedPrimaryStacks == 0) {
-			if (repairedSecondaryStacks > 0) {
-				FinishTrackedStack(a_ref, secondaryShader, GlowStackState{ true, repairedSecondaryStacks });
-			}
-			a_entry.appliedTier = LootTier::None;
-			++g_counters.postDoorDualRepairFailures;
-			REX::INFO("[LootGlow] post-door dual repair failed: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, desiredPrimaryStacks={}, desiredSecondaryStacks={}, repairedPrimaryStacks=0, repairedSecondaryStacks={}, reason={}, name={}",
-				a_entry.ref,
-				a_entry.refFormID,
-				a_entry.baseFormID,
-				TierName(tier),
-				oldPrimaryStacks,
-				oldSecondaryStacks,
-				desiredPrimaryStacks,
-				desiredSecondaryStacks,
-				repairedSecondaryStacks,
-				a_reason ? a_reason : "<none>",
-				a_entry.name[0] ? a_entry.name : "<unnamed>");
-			return false;
-		}
-
-		if (repairedSecondaryStacks == 0) {
-			a_entry.appliedTier = tier;
-			a_entry.valueGlow.applied = true;
-			a_entry.valueGlow.activeStacks = repairedPrimaryStacks;
-			a_entry.secondaryGlow = GlowStackState{};
-			a_entry.lastApplyMs = NowMs();
-			++g_counters.postDoorDualRepairFailures;
-			REX::INFO("[LootGlow] post-door dual repair incomplete: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, repairedPrimaryStacks={}/{}, repairedSecondaryStacks=0/{}, reason={}, name={}",
-				a_entry.ref,
-				a_entry.refFormID,
-				a_entry.baseFormID,
-				TierName(tier),
-				oldPrimaryStacks,
-				oldSecondaryStacks,
-				repairedPrimaryStacks,
-				desiredPrimaryStacks,
-				desiredSecondaryStacks,
-				a_reason ? a_reason : "<none>",
-				a_entry.name[0] ? a_entry.name : "<unnamed>");
-			return false;
-		}
-
-		a_entry.appliedTier = tier;
-		a_entry.valueGlow.applied = true;
-		a_entry.valueGlow.activeStacks = repairedPrimaryStacks;
-		a_entry.secondaryGlow.applied = repairedSecondaryStacks > 0;
-		a_entry.secondaryGlow.activeStacks = repairedSecondaryStacks;
-		a_entry.lastApplyMs = NowMs();
-
-		++g_counters.postDoorDualRepairSuccesses;
-		if (g_settings.debugLogging) {
-			REX::INFO("[LootGlow] post-door dual repair applied: ref={:016X}, refForm={:08X}, baseForm={:08X}, tier={}, oldPrimaryStacks={}, oldSecondaryStacks={}, repairedPrimaryStacks={}/{}, repairedSecondaryStacks={}/{}, current3D={:016X}, reason={}, name={}",
-				a_entry.ref,
-				a_entry.refFormID,
-				a_entry.baseFormID,
-				TierName(tier),
-				oldPrimaryStacks,
-				oldSecondaryStacks,
-				repairedPrimaryStacks,
-				desiredPrimaryStacks,
-				repairedSecondaryStacks,
-				desiredSecondaryStacks,
-				reinterpret_cast<std::uintptr_t>(current3D),
-				a_reason ? a_reason : "<none>",
-				a_entry.name[0] ? a_entry.name : "<unnamed>");
-		}
-		return true;
-	}
-
-	void RepairTrackedDualShadersAfterPlayerDoorArrival(const char* a_reason)
-	{
-		std::uint32_t visited = 0;
-		std::uint32_t attemptedBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairAttempts);
-		std::uint32_t successBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairSuccesses);
-		std::uint32_t failureBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairFailures);
-		std::uint32_t skippedBefore = static_cast<std::uint32_t>(g_counters.postDoorDualRepairSkipped);
-
-		for (auto& entry : g_trackedRefs) {
-			if (entry.ref == 0) {
-				continue;
-			}
-			++visited;
-			auto* ref = reinterpret_cast<RE::TESObjectREFR*>(entry.ref);
-			RepairDualShadersForTrackedRef(ref, entry, a_reason);
-		}
-
-		if (g_settings.debugLogging) {
-			REX::INFO("[LootGlow] post-door dual repair pass complete: reason={}, transitionSeq={}, visited={}, attempted={}, success={}, failure={}, skipped={}",
-				a_reason ? a_reason : "<none>",
-				g_playerDoorTransitionSeq,
-				visited,
-				static_cast<std::uint32_t>(g_counters.postDoorDualRepairAttempts) - attemptedBefore,
-				static_cast<std::uint32_t>(g_counters.postDoorDualRepairSuccesses) - successBefore,
-				static_cast<std::uint32_t>(g_counters.postDoorDualRepairFailures) - failureBefore,
-				static_cast<std::uint32_t>(g_counters.postDoorDualRepairSkipped) - skippedBefore);
-		}
-	}
-
 	bool RemoveAppliedLockpickGlow(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
 	{
 		if (!a_entry.appliedLockpickGlow || !a_entry.lockpickGlow.applied) {
@@ -1285,13 +1104,13 @@ namespace
 
 		++g_counters.removeAttempts;
 		const auto oldStacks = a_entry.lockpickGlow.activeStacks;
-		FinishTrackedStack(a_ref, shader, a_entry.lockpickGlow);
+		if (!FinishTrackedStack(a_ref, shader, a_entry.lockpickGlow)) return false;
 		a_entry.lockpickGlow = GlowStackState{};
 		a_entry.appliedLockpickGlow = false;
 		++g_counters.removeSuccesses;
 
 		if (g_settings.debugLogging) {
-			REX::INFO("[LootGlow] lockpick glow removed: ref={:016X}, refForm={:08X}, baseForm={:08X}, stacks={}, reason={}, name={}",
+			REX::INFO("[LootGlow] lockpick glow finish requested: ref={:016X}, refForm={:08X}, baseForm={:08X}, stacks={}, reason={}, name={}",
 				a_entry.ref,
 				a_entry.refFormID,
 				a_entry.baseFormID,
@@ -1370,7 +1189,7 @@ namespace
 		return true;
 	}
 
-	bool RemoveAllOwnedVisuals(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
+	bool RequestTrackedVisualFinish(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, const char* a_reason)
 	{
 		bool ok = true;
 		ok = RemoveAppliedValueGlow(a_ref, a_entry, a_reason) && ok;
@@ -1381,7 +1200,7 @@ namespace
 	bool RebuildVisualPlan(RE::TESObjectREFR* a_ref, TrackedRef& a_entry, DesiredVisualPlan a_desiredPlan, const char* a_reason)
 	{
 		++g_counters.rebuildAttempts;
-		if (!RemoveAllOwnedVisuals(a_ref, a_entry, a_reason)) {
+		if (!RequestTrackedVisualFinish(a_ref, a_entry, a_reason)) {
 			return false;
 		}
 
@@ -1467,73 +1286,6 @@ namespace LootGlow::TieredLoot
 		return fn(a_container, a_form);
 	}
 
-	// v0.4.1AE fix: materialize leveled-list contents before any classification.
-	// 1.512.105.0: FUN_14663D620 / RVA 0x0663D620 = GetOrCreateInventoryChanges(TESObjectREFR*).
-	// 1.512.105.0: FUN_146641AC0 / RVA 0x06641AC0 = materialize missing TESLevItem results into InventoryChanges.
-	// The materializer appears idempotent because generated entries are tagged with ExtraData type 0x36
-	// containing the source leveled-list index.
-	using GetOrCreateInventoryChangesFn = RE::InventoryChanges* (*)(RE::TESObjectREFR*);
-	using MaterializeLeveledContentsFn = void (*)(RE::InventoryChanges*);
-
-	RE::InventoryChanges* GetOrCreateInventoryChanges(RE::TESObjectREFR* a_ref)
-	{
-		if (!a_ref) {
-			return nullptr;
-		}
-		REL::Relocation<GetOrCreateInventoryChangesFn> fn{ REL::Offset(0x0663D620) };
-		return fn(a_ref);
-	}
-
-	void MaterializeLeveledContents(RE::InventoryChanges* a_changes)
-	{
-		if (!a_changes) {
-			return;
-		}
-		REL::Relocation<MaterializeLeveledContentsFn> fn{ REL::Offset(0x06641AC0) };
-		fn(a_changes);
-	}
-
-	bool IsProbablyTESLevItem(RE::TESForm* a_form)
-	{
-		if (!a_form) {
-			return false;
-		}
-		// Ghidra shows TESLevItem checks in this inventory cluster as *(char*)(form + 0x08) == '+'.
-		// This avoids requiring a TESLevItem header that may not exist in CommonLibOB64.
-		const auto addr = reinterpret_cast<std::uintptr_t>(a_form);
-		return *reinterpret_cast<const char*>(addr + 0x08) == '+';
-	}
-
-	std::uint32_t CountBaseLeveledEntries(RE::TESContainer* a_container)
-	{
-		if (!a_container) {
-			return 0;
-		}
-		std::uint32_t count = 0;
-		for (auto it = a_container->objectList.begin(); it != a_container->objectList.end(); ++it) {
-			auto* obj = reinterpret_cast<RE::ContainerObject*>(*it);
-			if (obj && obj->type && IsProbablyTESLevItem(obj->type)) {
-				++count;
-			}
-		}
-		return count;
-	}
-
-	std::uint32_t CountRuntimeChangeEntries(RE::InventoryChanges* a_changes)
-	{
-		if (!a_changes || !a_changes->list) {
-			return 0;
-		}
-		std::uint32_t count = 0;
-		for (auto it = a_changes->list->begin(); it != a_changes->list->end(); ++it) {
-			if (*it) {
-				++count;
-			}
-		}
-		return count;
-	}
-
-
 	std::uint32_t GetFormID(RE::TESForm* a_form)
 	{
 		return a_form ? static_cast<std::uint32_t>(a_form->GetFormID()) : 0;
@@ -1606,92 +1358,6 @@ namespace LootGlow::TieredLoot
 		return {};
 	}
 
-#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
-	ItemValueResult TryReadTESValueFormValue(RE::TESForm* a_form)
-	{
-		if (!a_form) {
-			return {};
-		}
-#if defined(_MSC_VER)
-		__try {
-#endif
-			auto* valueForm = dynamic_cast<RE::TESValueForm*>(a_form);
-			if (valueForm) {
-				if constexpr (HasValueMember<RE::TESValueForm>::value) {
-					return { true, static_cast<std::uint32_t>(valueForm->value) };
-				}
-			}
-#if defined(_MSC_VER)
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return {};
-		}
-#endif
-		return {};
-	}
-#endif
-
-	ItemValueResult TryReadIngredientItemValue(RE::TESForm* a_form)
-	{
-#if LOOTGLOW_HAS_INGREDIENTITEM_HEADER
-		if (!a_form) {
-			return {};
-		}
-		auto* ingredient = a_form->As<RE::IngredientItem>();
-		if (!ingredient) {
-			return {};
-		}
-
-		// IngredientItem is not a TESValueForm in current CommonLibOB64.
-		// It derives through MagicItemObject and stores its player-facing value in
-		// IngredientItemData::costOverride. Prefer MagicItem::GetCost when available,
-		// then fall back to the concrete data field.
-#if LOOTGLOW_HAS_MAGICITEM_HEADER
-#if defined(_MSC_VER)
-		__try {
-#endif
-			auto* magicItem = dynamic_cast<RE::MagicItem*>(ingredient);
-			if (magicItem) {
-				const auto cost = magicItem->GetCost(nullptr);
-				if (cost > 0.0F) {
-					return { true, static_cast<std::uint32_t>(cost + 0.5F) };
-				}
-			}
-#if defined(_MSC_VER)
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return {};
-		}
-#endif
-#endif
-
-		if (ingredient->data.costOverride > 0) {
-			return { true, static_cast<std::uint32_t>(ingredient->data.costOverride) };
-		}
-
-		if (auto value = TryReadValueAs<RE::IngredientItem>(a_form); value.available) {
-			return value;
-		}
-#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
-#if defined(_MSC_VER)
-		__try {
-#endif
-			auto* valueForm = dynamic_cast<RE::TESValueForm*>(ingredient);
-			if (valueForm) {
-				if constexpr (HasValueMember<RE::TESValueForm>::value) {
-					return { true, static_cast<std::uint32_t>(valueForm->value) };
-				}
-			}
-#if defined(_MSC_VER)
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return {};
-		}
-#endif
-#endif
-#else
-		(void)a_form;
-#endif
-		return {};
-	}
-
 	ItemValueResult GetItemBaseGoldValue(RE::TESForm* a_form)
 	{
 		if (!a_form) {
@@ -1699,10 +1365,6 @@ namespace LootGlow::TieredLoot
 		}
 #if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
 		if (auto value = TryReadAlchemyItemValue(a_form); value.available) { return value; }
-#endif
-		if (auto value = TryReadIngredientItemValue(a_form); value.available) { return value; }
-#if LOOTGLOW_HAS_TESVALUEFORM_HEADER
-		if (auto value = TryReadTESValueFormValue(a_form); value.available) { return value; }
 #endif
 #if LOOTGLOW_HAS_TESOBJECTMISC_HEADER
 		if (auto value = TryReadValueAs<RE::TESObjectMISC>(a_form); value.available) { return value; }
@@ -1825,8 +1487,6 @@ namespace LootGlow::TieredLoot
 	{
 		bool baseAvailable{ false };
 		std::uint32_t baseValue{ 0 };
-		bool alchemyItem{ false };
-		bool ingredientItem{ false };
 		bool enchantable{ false };
 		RE::TESFormID enchantmentFormID{ 0 };
 		float magicItemCost{ 0.0F };
@@ -1895,9 +1555,9 @@ namespace LootGlow::TieredLoot
 
 		// v0.4.1O: table-driven worn-apparel enchantment value rules, including flat-cost worn effects.
 		//
-		// Diagnostic v0.4.1E/F found the first enchantment effect entry at
-		// EnchantmentItem + 0x50, with stored magnitude at +0x0C and an observed
-		// effect/value code at +0x5C. For the two confirmed shirts:
+		// The first enchantment effect entry is at EnchantmentItem + 0x50,
+		// with stored magnitude at +0x0C and an effect/value code at +0x5C.
+		// For the two confirmed shirts:
 		//
 		//   effectCode 29, magnitude 6 -> Fortify Skill/Speechcraft-style:
 		//      base 6 + round(6 * 100) = 606
@@ -1968,7 +1628,7 @@ namespace LootGlow::TieredLoot
 		case 26:  // Acrobatics
 		case 27:  // Light Armor
 		case 28:  // Marksman
-		case 29:  // Mercantile/Speechcraft observed code path in diagnostic item
+		case 29:  // Mercantile/Speechcraft effect code
 		case 30:  // Security
 		case 31:  // Sneak
 		case 32:  // Speechcraft / Fortify Skill-style
@@ -1976,10 +1636,7 @@ namespace LootGlow::TieredLoot
 			return true;
 
 		// Resist-style worn effects. The exact code ordering is still being
-		// validated. v0.4.2C confirms effectCode 53 = Resist Disease
-		// with 20 magnitude on LOC_FN_EnchClothingShirtResistDisease.
-		// v0.4.1F previously confirmed effectCode 66 = Resist Poison.
-		case 53:
+		// validated, but code 66 = Resist Poison is confirmed by v0.4.1F.
 		case 60:
 			a_outRule = { 15.0F, 0, "Resist Disease-style" };
 			return true;
@@ -2092,34 +1749,12 @@ namespace LootGlow::TieredLoot
 	}
 
 
-	bool IsAlchemyItemFormForValue(RE::TESForm* a_form)
-	{
-#if LOOTGLOW_HAS_ALCHEMYITEM_HEADER
-		return a_form && a_form->As<RE::AlchemyItem>() != nullptr;
-#else
-		(void)a_form;
-		return false;
-#endif
-	}
-
-	bool IsIngredientItemFormForValue(RE::TESForm* a_form)
-	{
-#if LOOTGLOW_HAS_INGREDIENTITEM_HEADER
-		return a_form && a_form->As<RE::IngredientItem>() != nullptr;
-#else
-		(void)a_form;
-		return false;
-#endif
-	}
-
 	ItemValueDetails EstimateFullGoldValueDetails(RE::TESForm* a_form)
 	{
 		ItemValueDetails details{};
 		const auto baseValue = GetItemBaseGoldValue(a_form);
 		details.baseAvailable = baseValue.available;
 		details.baseValue = baseValue.value;
-		details.alchemyItem = IsAlchemyItemFormForValue(a_form);
-		details.ingredientItem = IsIngredientItemFormForValue(a_form);
 		if (!baseValue.available) {
 			return details;
 		}
@@ -2717,33 +2352,6 @@ namespace LootGlow::TieredLoot
 
 		const auto valueDetails = EstimateFullGoldValueDetails(a_form);
 		const auto fullValueEach = valueDetails.fullValue;
-		if (g_settings.debugItemValues) {
-			const char* itemName = "<unnamed>";
-			if (auto* rawName = RE::TESFullName::GetFullName(a_form)) {
-				itemName = rawName;
-			}
-			REX::INFO("[LootGlow] item value diagnostic: form={:08X}, count={}, uniqueKnown={}, baseAvailable={}, baseValue={}, alchemyItem={}, ingredientItem={}, enchantable={}, enchantment={:08X}, magicCost={:.2f}, costOverride={:.2f}, charge={}, enchantmentBonus={}, wornEnchantMagnitude={}, wornEnchantEffectCode={}, wornEnchantBarterFactor={:.2f}, wornEnchantBonus={}, fullValueEach={}, stackValue={}, name={}",
-				GetFormID(a_form),
-				a_count,
-				knownUniqueItem,
-				valueDetails.baseAvailable,
-				valueDetails.baseValue,
-				valueDetails.alchemyItem,
-				valueDetails.ingredientItem,
-				valueDetails.enchantable,
-				static_cast<std::uint32_t>(valueDetails.enchantmentFormID),
-				valueDetails.magicItemCost,
-				valueDetails.costOverride,
-				valueDetails.amountOfEnchantment,
-				valueDetails.enchantmentBonus,
-				valueDetails.wornEnchantMagnitude,
-				valueDetails.wornEnchantEffectCode,
-				valueDetails.wornEnchantBarterFactor,
-				valueDetails.wornEnchantBonus,
-				fullValueEach,
-				static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(a_count),
-				itemName);
-		}
 		if (fullValueEach > 0) {
 			++a_summary.knownItems;
 			a_summary.knownFullValueTotal += static_cast<std::uint64_t>(fullValueEach) * static_cast<std::uint64_t>(a_count);
@@ -2763,13 +2371,6 @@ namespace LootGlow::TieredLoot
 		for (auto it = a_container->objectList.begin(); it != a_container->objectList.end(); ++it) {
 			auto* obj = reinterpret_cast<RE::ContainerObject*>(*it);
 			if (!obj || !obj->type) {
-				continue;
-			}
-
-			// TESLevItem base entries are unresolved placeholders, not concrete loot.
-			// v0.4.1AE: never classify a container from the leveled-list placeholder itself;
-			// materialized concrete results are counted later from InventoryChanges.
-			if (IsProbablyTESLevItem(obj->type)) {
 				continue;
 			}
 
@@ -2799,9 +2400,6 @@ namespace LootGlow::TieredLoot
 		if (!LooksPointerish(ref)) {
 			return nullptr;
 		}
-		if (auto* existing = ::FindTrackedRef(ref)) {
-			return existing;
-		}
 
 		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
 		auto* objectContainer = baseObject ? baseObject->As<RE::TESObjectCONT>() : nullptr;
@@ -2816,84 +2414,133 @@ namespace LootGlow::TieredLoot
 		return ::TrackContainer(a_ref, objectContainer, name);
 	}
 
-	void MaterializeLeveledContentsBeforeClassification(RE::TESObjectREFR* a_ref, RE::TESContainer* a_container, TrackedRef& a_entry, const char* a_source)
+	enum class LegacyNormalizationResult
 	{
-		if (!a_ref || !a_container || a_entry.leveledMaterializationDone) {
-			return;
+		Ready,
+		Waiting
+	};
+
+	// Removes configured LootGlow shaders that were saved on a reference by an
+	// earlier session.  This deliberately runs before this session records or
+	// applies any stacks, so normal ownership remains unambiguous afterwards.
+	LegacyNormalizationResult NormalizeLegacyGlow(RE::TESObjectREFR* a_ref, TrackedRef& a_entry)
+	{
+		if (!g_settings.legacyGlowNormalizationMode ||
+			(!a_entry.legacyNormalizationCheckNeeded && !a_entry.legacyNormalizationPending)) {
+			return LegacyNormalizationResult::Ready;
+		}
+		if (!::g_recoveryLayoutReady || !a_ref) {
+			REX::WARN("[LootGlow legacy-normalize] unavailable: native effect-list layout is not verified; ref={:08X}", a_entry.refFormID);
+			return LegacyNormalizationResult::Waiting;
 		}
 
-		const auto baseLeveledEntries = CountBaseLeveledEntries(a_container);
-		if (baseLeveledEntries == 0) {
-			return;
+		const auto target = reinterpret_cast<std::uintptr_t>(a_ref);
+		const auto manager = reinterpret_cast<std::uintptr_t>(::GetProcessLists());
+		if (!LooksPointerish(target) || !LootGlowRecovery::AddressRange(manager, 0xA0)) {
+			REX::WARN("[LootGlow legacy-normalize] unavailable: invalid target or effect-list manager; ref={:08X}", a_entry.refFormID);
+			return LegacyNormalizationResult::Waiting;
 		}
 
-		// Mark before calling the engine materializer so repeated LoadGraphics/hover passes cannot
-		// stack duplicate work if the engine re-enters this path. FUN_146641AC0 itself also checks
-		// ExtraData 0x36 source indices before generating entries.
-		a_entry.leveledMaterializationDone = true;
-		++g_counters.pendingMaterializeCandidates;
+		auto snapshot = LootGlowRecovery::Capture(manager + kProcessListsMagicEffectHeadItemOffset,
+			::g_effectVtable, target, 0, 0, ::CopyGameMemory, ::NowMs);
+		if (snapshot.status != LootGlowRecovery::Status::Checked || snapshot.unknownVtables != 0) {
+			REX::WARN("[LootGlow legacy-normalize] deferred: effect list was not fully verified; ref={:08X} status={} unknownVtables={}",
+				a_entry.refFormID, LootGlowRecovery::StatusName(snapshot.status), snapshot.unknownVtables);
+			return LegacyNormalizationResult::Waiting;
+		}
 
-		const auto beforeSummary = ScanContainerValue(a_ref, a_container);
-		auto* beforeChanges = GetInventoryChanges(a_ref);
-		const auto beforeRuntimeEntries = CountRuntimeChangeEntries(beforeChanges);
-		const auto beforeValue = beforeSummary.KnownValueTotal();
-		const auto beforeHighest = beforeSummary.HighestValueCandidate();
-		const auto beforeUnique = beforeSummary.uniqueItems;
-		const auto beforeGold = beforeSummary.goldTotalCount;
-		const auto beforePicks = beforeSummary.lockpickTotalCount;
+		const std::array<RE::TESFormID, 8> shaderForms{
+			g_settings.lowTierShaderFormID,
+			g_settings.mediumTierShaderFormID,
+			g_settings.highTierShaderFormID,
+			g_settings.insaneTierShaderFormID,
+			g_settings.insaneTierSecondaryEnabled ? g_settings.insaneTierSecondaryShaderFormID : 0,
+			g_settings.uniqueItemShaderFormID,
+			g_settings.uniqueItemSecondaryEnabled ? g_settings.uniqueItemSecondaryShaderFormID : 0,
+			g_settings.lockpickShaderFormID
+		};
+		auto hasSavedShader = [&](RE::TESFormID a_formID) {
+			return a_formID != 0 && std::any_of(snapshot.candidates.begin(), snapshot.candidates.end(), [=](const auto& candidate) {
+				return candidate.targetMatch && candidate.shaderForm == a_formID;
+			});
+		};
 
-		auto* changes = GetOrCreateInventoryChanges(a_ref);
-		if (!changes) {
-			++g_counters.pendingMaterializeNoChange;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] leveled-materialize skipped: source={}, GetOrCreateInventoryChanges returned null for ref={:08X}/{:08X}, baseLeveledEntries={}, name={}",
-					a_source ? a_source : "scan",
-					GetFormID(a_ref),
-					a_entry.baseFormID,
-					baseLeveledEntries,
-					a_entry.name[0] ? a_entry.name : "<unnamed>");
+		bool foundSavedGlow = false;
+		bool cleanupIssued = false;
+		if (a_entry.legacyNormalizationPending) {
+			for (const auto shaderForm : shaderForms) {
+				if (hasSavedShader(shaderForm)) {
+					return LegacyNormalizationResult::Waiting;
+				}
 			}
-			return;
+			REX::INFO("[LootGlow legacy-normalize] complete: ref={:08X}", a_entry.refFormID);
+			a_entry.legacyNormalizationPending = false;
+			a_entry.legacyNormalizationCheckNeeded = false;
+			// Cleanup removed this session's stacks along with the saved extras.
+			// RebuildVisualPlan must see an empty owned plan on this scan.
+			a_entry.valueGlow = {};
+			a_entry.secondaryGlow = {};
+			a_entry.lockpickGlow = {};
+			a_entry.appliedTier = LootTier::None;
+			a_entry.appliedLockpickGlow = false;
+			return LegacyNormalizationResult::Ready;
 		}
-
-		++g_counters.pendingMaterializeAttempts;
-		MaterializeLeveledContents(changes);
-
-		const auto afterSummary = ScanContainerValue(a_ref, a_container);
-		const auto afterRuntimeEntries = CountRuntimeChangeEntries(GetInventoryChanges(a_ref));
-		const bool changed =
-			afterRuntimeEntries != beforeRuntimeEntries ||
-			afterSummary.KnownValueTotal() != beforeValue ||
-			afterSummary.HighestValueCandidate() != beforeHighest ||
-			afterSummary.uniqueItems != beforeUnique ||
-			afterSummary.goldTotalCount != beforeGold ||
-			afterSummary.lockpickTotalCount != beforePicks;
-
-		if (changed) {
-			++g_counters.pendingMaterializeResolved;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] leveled-materialize before-classify changed: source={}, ref={:08X}/{:08X}, baseLeveledEntries={}, runtimeEntries {}->{}, value {}->{}, highest {}->{}, uniqueItems {}->{}, gold {}->{}, picks {}->{}, name={}",
-					a_source ? a_source : "scan",
-					GetFormID(a_ref),
-					a_entry.baseFormID,
-					baseLeveledEntries,
-					beforeRuntimeEntries,
-					afterRuntimeEntries,
-					beforeValue,
-					afterSummary.KnownValueTotal(),
-					beforeHighest,
-					afterSummary.HighestValueCandidate(),
-					beforeUnique,
-					afterSummary.uniqueItems,
-					beforeGold,
-					afterSummary.goldTotalCount,
-					beforePicks,
-					afterSummary.lockpickTotalCount,
-					a_entry.name[0] ? a_entry.name : "<unnamed>");
+		auto expectedStacksFor = [&](RE::TESFormID a_formID) {
+			std::uint32_t expected = 0;
+			if (a_entry.valueGlow.applied && ::TierShaderFormID(a_entry.appliedTier) == a_formID)
+				expected += a_entry.valueGlow.activeStacks;
+			if (a_entry.secondaryGlow.applied && ::TierSecondaryShaderFormID(a_entry.appliedTier) == a_formID)
+				expected += a_entry.secondaryGlow.activeStacks;
+			if (a_entry.lockpickGlow.applied && g_settings.lockpickShaderFormID == a_formID)
+				expected += a_entry.lockpickGlow.activeStacks;
+			return expected;
+		};
+		bool excessEffects = false;
+		for (std::size_t shaderIndex = 0; shaderIndex < shaderForms.size(); ++shaderIndex) {
+			const auto shaderForm = shaderForms[shaderIndex];
+			if (!shaderForm || std::find(shaderForms.begin(), shaderForms.begin() + shaderIndex, shaderForm) != shaderForms.begin() + shaderIndex)
+				continue;
+			const auto actual = std::count_if(snapshot.candidates.begin(), snapshot.candidates.end(), [=](const auto& candidate) {
+				return candidate.targetMatch && candidate.shaderForm == shaderForm;
+			});
+			if (actual > expectedStacksFor(shaderForm)) {
+				excessEffects = true;
+				REX::INFO("[LootGlow legacy-normalize] excess effects: ref={:08X} shader={:08X} actual={} expected={}",
+					a_entry.refFormID, shaderForm, actual, expectedStacksFor(shaderForm));
 			}
-		} else {
-			++g_counters.pendingMaterializeNoChange;
 		}
+		if (!excessEffects) {
+			a_entry.legacyNormalizationCheckNeeded = false;
+			return LegacyNormalizationResult::Ready;
+		}
+		for (std::size_t shaderIndex = 0; shaderIndex < shaderForms.size(); ++shaderIndex) {
+			const auto shaderForm = shaderForms[shaderIndex];
+			if (!hasSavedShader(shaderForm)) {
+				continue;
+			}
+			foundSavedGlow = true;
+			// Avoid duplicate Finish calls if users intentionally configure two tiers
+			// with the same shader form.
+			if (std::find(shaderForms.begin(), shaderForms.begin() + shaderIndex, shaderForm) != shaderForms.begin() + shaderIndex) {
+				continue;
+			}
+			auto* shader = RE::TESForm::LookupByID<RE::TESEffectShader>(shaderForm);
+			if (!shader || !::FinishMagicShaderHitEffect(a_ref, shader)) {
+				REX::WARN("[LootGlow legacy-normalize] could not request cleanup: ref={:08X} shader={:08X}", a_entry.refFormID, shaderForm);
+				return LegacyNormalizationResult::Waiting;
+			}
+			cleanupIssued = true;
+		}
+
+		if (!foundSavedGlow) {
+			return LegacyNormalizationResult::Ready;
+		}
+
+		a_entry.legacyNormalizationPending = true;
+		if (cleanupIssued) {
+			REX::INFO("[LootGlow legacy-normalize] cleanup requested: ref={:08X}; waiting for native removal", a_entry.refFormID);
+		}
+		return LegacyNormalizationResult::Waiting;
 	}
 
 	bool ScanAndApplyTier(RE::TESObjectREFR* a_ref, const char* a_source)
@@ -2901,6 +2548,9 @@ namespace LootGlow::TieredLoot
 		if (!a_ref) {
 			return false;
 		}
+
+		// This reference came from an engine callback, never from cached-pointer traversal.
+        if (!a_ref->Get3D()) return false;
 
 		auto* container = GetContainer(a_ref);
 		if (!container) {
@@ -2912,12 +2562,6 @@ namespace LootGlow::TieredLoot
 		if (!entry) {
 			return false;
 		}
-
-		// v0.4.1AE: materialize leveled-list contents before the first classification scan.
-		// This prevents LoadGraphics/hover paths from briefly applying a tier based on
-		// unresolved TESLevItem placeholder entries.
-		MaterializeLeveledContentsBeforeClassification(a_ref, container, *entry, a_source);
-
 		const auto summary = ScanContainerValue(a_ref, container);
 		const auto knownValueTotal = summary.KnownValueTotal();
 		const auto highestValueCandidate = summary.HighestValueCandidate();
@@ -2953,6 +2597,13 @@ namespace LootGlow::TieredLoot
 		}
 		if (desiredLockpickGlow) {
 			++g_counters.lockpickDesired;
+		}
+
+		// LoadGraphics can precede restoration of saved native effects. Apply the
+		// normal visual now and compare the live list on the next hover.
+		if ((!a_source || std::strcmp(a_source, "loadgraphics") != 0) &&
+			NormalizeLegacyGlow(a_ref, *entry) == LegacyNormalizationResult::Waiting) {
+			return false;
 		}
 
 		const bool classificationChanged =
@@ -3025,132 +2676,447 @@ namespace LootGlow::TieredLoot
 
 }
 
-
-struct Hook_PlayerSetParentCell_DualShaderRepair
+namespace
 {
-	static void SetParentCell(RE::PlayerCharacter* a_player, RE::TESObjectCELL* a_cell)
-	{
-		auto* singleton = RE::PlayerCharacter::GetSingleton();
-		if (a_player != singleton) {
-			SetParentCellHook(a_player, a_cell);
-			return;
-		}
+    template<class T> bool ReadGameValue(std::uintptr_t address, T& value)
+    {
+        return CopyGameMemory(address, &value, sizeof(value));
+    }
 
-		const auto playerPtr = PtrValue(a_player);
-		const auto oldParentCellPtr = PtrValue(a_player ? a_player->parentCell : nullptr);
-		const bool incomingNull = a_cell == nullptr;
-		const auto current3DBeforePtr = PtrValue(a_player ? a_player->Get3D() : nullptr);
-		const bool travelUseDoorBefore = a_player ? a_player->travelUseDoor : false;
-		const bool transportingBefore = a_player ? a_player->transporting : false;
-		auto* lastDoorBefore = a_player ? a_player->lastDoorActivated : nullptr;
-		auto* pendingDoorBefore = a_player ? a_player->pendingDoorTeleportationInfo.teleportingDoor : nullptr;
-		auto* objectToGetBefore = a_player ? a_player->pendingDoorTeleportationInfo.objectToGet : nullptr;
-		const auto lastDoorBeforePtr = PtrValue(lastDoorBefore);
-		const auto pendingDoorBeforePtr = PtrValue(pendingDoorBefore);
-		const auto lastDoorBeforeForm = lastDoorBefore ? lastDoorBefore->GetFormID() : 0;
-		const auto pendingDoorBeforeForm = pendingDoorBefore ? pendingDoorBefore->GetFormID() : 0;
-		const auto pendingCountBefore = a_player ? a_player->pendingDoorTeleportationInfo.count : 0;
-		const bool pendingBefore = pendingDoorBefore != nullptr || objectToGetBefore != nullptr || pendingCountBefore != 0;
+    bool RelativeCallDisplacement(std::uintptr_t site, std::uintptr_t target, std::int32_t& out)
+    {
+        const auto delta = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(site + 5);
+        if (delta < INT32_MIN || delta > INT32_MAX) return false;
+        out = static_cast<std::int32_t>(delta);
+        return true;
+    }
+}
 
-		const bool doorTransitionBegin = incomingNull && (transportingBefore || pendingBefore || lastDoorBefore != nullptr) && current3DBeforePtr != 0;
-		if (doorTransitionBegin && !g_playerDoorTransitionActive) {
-			g_playerDoorTransitionActive = true;
-			++g_playerDoorTransitionSeq;
-			++g_counters.playerDoorTransitionBegins;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] player door transition begin detected: seq={}, player={:016X}, oldParentCell={:016X}, pendingDoor={:016X}/{:08X}, lastDoor={:016X}/{:08X}, transporting={}, travelUseDoor={}, pendingCount={}",
-					g_playerDoorTransitionSeq,
-					playerPtr,
-					oldParentCellPtr,
-					pendingDoorBeforePtr,
-					pendingDoorBeforeForm,
-					lastDoorBeforePtr,
-					lastDoorBeforeForm,
-					transportingBefore ? "true" : "false",
-					travelUseDoorBefore ? "true" : "false",
-					pendingCountBefore);
-			}
-		}
+namespace LootGlow::DualReloadRecovery
+{
+    struct Effect { std::uintptr_t address{}; std::uint32_t shader{}; };
+    struct Pending
+    {
+        std::uintptr_t selected{}, alternate{};
+        std::uintptr_t target{}, manager{};
+        std::uint32_t selectedShader{}, alternateShader{};
+        LootTier tier{ LootTier::None };
+        bool lockpick{};
+        bool fullStacks{};
+        std::size_t effectCount{};
+        std::size_t primaryCount{}, secondaryCount{};
+        std::array<Effect, 32> effects{};
+    };
+    inline thread_local Pending pending{};
+    inline constexpr std::uintptr_t outerVtableRVA = 0x08661128;
+}
 
-		SetParentCellHook(a_player, a_cell);
+namespace LootGlow::RecoveryInitialization
+{
+    // Complete-object vtable +0x38, verified at RVA 08661160.
+    // Preserve the entire return register, not merely its success byte.
+    using Callback = std::uintptr_t (*)(std::uintptr_t);
+    inline Callback original=nullptr;
+    inline bool installed=false;
+    inline std::uintptr_t imageBase=0;
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#else
+    __attribute__((noinline))
+#endif
+    std::uintptr_t Observe(std::uintptr_t effect)
+    {
+        // Capture here, never in an out-of-line helper: this is the caller of
+        // the virtual initialization slot. No stack walking or retained pointers.
+#if defined(_MSC_VER)
+        const auto caller=reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+#else
+        const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+#endif
+        const auto result = original(effect); // Exactly once; engine exceptions propagate.
+        // Only an opted-in paired Insane or Unique ref, only the native reload callsite,
+        // and only after the engine-selected initializer succeeds.  The
+        // selector remains untouched; its unselected live list member is
+        // initialized through the same verified original method once.
+        if ((::g_settings.insaneTierDualReinitMode || ::g_settings.uniqueItemDualReinitMode ||
+            ::g_settings.singleShaderFullReinitMode) &&
+            caller == imageBase + 0x0666076C && (result & 0xFF) != 0) {
+            const auto pending = DualReloadRecovery::pending;
+            DualReloadRecovery::pending = {};
+            if (pending.selected == effect && !pending.alternate) {
+                std::uintptr_t vtable{}, selectedRef{}, shader{};
+                std::uint32_t shaderID{};
+                const bool valid = ::CopyGameMemory(effect, &vtable, sizeof(vtable)) &&
+                    vtable == imageBase + DualReloadRecovery::outerVtableRVA &&
+                    ::CopyGameMemory(effect + 0x48, &selectedRef, sizeof(selectedRef)) &&
+                    selectedRef == pending.target &&
+                    ::CopyGameMemory(effect + 0x68, &shader, sizeof(shader)) && shader &&
+                    ::CopyGameMemory(shader + 0x10, &shaderID, sizeof(shaderID)) &&
+                    shaderID == pending.selectedShader;
+                if (!valid) {
+                    REX::WARN("[LootGlow stack-reinit] skipped: selected effect validation failed for ref={:016X}",
+                        pending.target);
+                } else if (pending.fullStacks && ::g_settings.singleShaderFullReinitMode &&
+                    pending.manager == reinterpret_cast<std::uintptr_t>(::GetProcessLists())) {
+                    std::size_t restored = 1;
+                    for (std::size_t index = 0; index < pending.effectCount; ++index) {
+                        const auto candidate = pending.effects[index];
+                        if (candidate.address == effect) continue;
+                        const auto fresh = LootGlowRecovery::Capture(pending.manager + 0x90,
+                            ::g_effectVtable, pending.target, pending.selectedShader, 0,
+                            ::CopyGameMemory, ::NowMs);
+                        bool live = false;
+                        if (fresh.status == LootGlowRecovery::Status::Checked && !fresh.unknownVtables)
+                            for (const auto& entry : fresh.candidates)
+                                if (entry.completeEffect == candidate.address && entry.targetMatch &&
+                                    entry.eligible && entry.shaderForm == candidate.shader)
+                                    live = true;
+                        if (!live || (original(candidate.address) & 0xFF) == 0) {
+                            REX::WARN("[LootGlow stack-reinit] stopped: ref={:016X} restored={} requested={} candidate={:016X} live={}",
+                                pending.target, restored, pending.effectCount, candidate.address, live);
+                            break;
+                        }
+                        ++restored;
+                    }
+                    REX::INFO("[LootGlow stack-reinit] tier={} ref={:016X} restored={} requested={}",
+                        pending.lockpick ? "Lockpick" : TierName(pending.tier), pending.target,
+                        restored, pending.effectCount);
+                }
+            }
+            if (pending.selected == effect && pending.alternate) {
+                std::uintptr_t vtable{}, shader{}, selectedShader{}, selectedRef{}, alternateRef{};
+                std::uint32_t shaderID{}, selectedShaderID{};
+                const bool valid = ::CopyGameMemory(pending.alternate, &vtable, sizeof(vtable)) &&
+                    vtable == imageBase + DualReloadRecovery::outerVtableRVA &&
+                    ::CopyGameMemory(effect + 0x48, &selectedRef, sizeof(selectedRef)) &&
+                    ::CopyGameMemory(pending.alternate + 0x48, &alternateRef, sizeof(alternateRef)) &&
+                    selectedRef == pending.target && alternateRef == pending.target &&
+                    ::CopyGameMemory(effect + 0x68, &selectedShader, sizeof(selectedShader)) && selectedShader &&
+                    ::CopyGameMemory(selectedShader + 0x10, &selectedShaderID, sizeof(selectedShaderID)) &&
+                    selectedShaderID == pending.selectedShader &&
+                    ::CopyGameMemory(pending.alternate + 0x68, &shader, sizeof(shader)) && shader &&
+                    ::CopyGameMemory(shader + 0x10, &shaderID, sizeof(shaderID)) &&
+                    shaderID == pending.alternateShader;
+                if (valid) {
+                    const auto alternateResult = original(pending.alternate);
+                    if ((alternateResult & 0xFF) == 0)
+                        REX::WARN("[LootGlow recovery] alternate initializer failed: ref={:016X} shader={:08X}",
+                            pending.target, shaderID);
+                    const bool fullModeEnabled =
+                        (pending.tier == LootTier::Unique && ::g_settings.uniqueItemDualReinitMode &&
+                            ::g_settings.uniqueItemFullReinitMode) ||
+                        (pending.tier == LootTier::Insane && ::g_settings.insaneTierDualReinitMode &&
+                            ::g_settings.insaneTierFullReinitMode);
+                    if (pending.fullStacks && (alternateResult & 0xFF) != 0 && fullModeEnabled &&
+                        pending.manager == reinterpret_cast<std::uintptr_t>(::GetProcessLists())) {
+                        std::size_t restored = 2;
+                        for (std::size_t index = 0; index < pending.effectCount; ++index) {
+                            const auto candidate = pending.effects[index];
+                            if (candidate.address == effect || candidate.address == pending.alternate) continue;
+                            // The initializer may change effect state. Verify fresh list
+                            // membership and identity before every additional native call.
+                            const auto fresh = LootGlowRecovery::Capture(pending.manager + 0x90,
+                                ::g_effectVtable, pending.target, pending.selectedShader,
+                                pending.alternateShader, ::CopyGameMemory, ::NowMs);
+                            bool live = false;
+                            if (fresh.status == LootGlowRecovery::Status::Checked && !fresh.unknownVtables)
+                                for (const auto& entry : fresh.candidates)
+                                    if (entry.completeEffect == candidate.address && entry.targetMatch &&
+                                        entry.eligible && entry.shaderForm == candidate.shader)
+                                        live = true;
+                            if (!live || (original(candidate.address) & 0xFF) == 0) {
+                                REX::WARN("[LootGlow full-reinit] stopped: ref={:016X} restored={} requested={} candidate={:016X} live={}",
+                                    pending.target, restored, pending.effectCount, candidate.address, live);
+                                break;
+                            }
+                            ++restored;
+                        }
+                        REX::INFO("[LootGlow full-reinit] tier={} ref={:016X} restored={} requested={}",
+                            TierName(pending.tier), pending.target, restored, pending.effectCount);
+                    }
+                } else {
+                    REX::WARN("[LootGlow dual-reinit] skipped alternate initialization: ref={:016X} selectedShader={:08X} alternateShader={:08X} validation failed",
+                        pending.target, pending.selectedShader, pending.alternateShader);
+                }
+            }
+        }
+        return result;
+    }
+    void Install()
+    {
+        if (installed) return;
+        if (!::g_recoveryLayoutReady) {
+            REX::INFO("[LootGlow recovery/init] NOT installed: exact executable fingerprint/layout not verified"); return;
+        }
+        const auto base=reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+        const auto slot=base+0x08661160;
+        const auto target=base+0x068AB9F0;
+        std::uintptr_t saved=0;
+        if (!ReadGameValue(slot,saved) || saved!=target) {
+            REX::INFO("[LootGlow recovery/init] NOT installed: complete-object initialization slot mismatch"); return;
+        }
+        DWORD previous=0;
+        if (!::VirtualProtect(reinterpret_cast<void*>(slot),sizeof(saved),PAGE_READWRITE,&previous)) {
+            REX::INFO("[LootGlow recovery/init] NOT installed: slot protection change failed"); return;
+        }
+        std::uintptr_t again=0;
+        if (ReadGameValue(slot,again) && again==saved) {
+            original=reinterpret_cast<Callback>(target);
+            imageBase=base;
+            const auto replacement=reinterpret_cast<std::uintptr_t>(&Observe);
+            // Startup-only aligned pointer replacement; original code remains intact.
+            std::memcpy(reinterpret_cast<void*>(slot),&replacement,sizeof(replacement));
+            installed=true;
+        }
+        DWORD unused=0;
+        if (!::VirtualProtect(reinterpret_cast<void*>(slot),sizeof(saved),previous,&unused))
+            REX::INFO("[LootGlow recovery/init] slot protection restore failed");
+        if (installed)
+            REX::INFO("[LootGlow recovery/init] initializer hook installed: slot=08661160 original=068AB9F0");
+        else REX::INFO("[LootGlow recovery/init] NOT installed: slot changed before patch");
+    }
+}
 
-		const auto newParentCellPtr = PtrValue(a_player ? a_player->parentCell : nullptr);
-		const auto current3DAfterPtr = PtrValue(a_player ? a_player->Get3D() : nullptr);
-		const bool travelUseDoorAfter = a_player ? a_player->travelUseDoor : false;
-		const bool transportingAfter = a_player ? a_player->transporting : false;
-		auto* lastDoorAfter = a_player ? a_player->lastDoorActivated : nullptr;
-		auto* pendingDoorAfter = a_player ? a_player->pendingDoorTeleportationInfo.teleportingDoor : nullptr;
-		const auto lastDoorAfterPtr = PtrValue(lastDoorAfter);
-		const auto pendingDoorAfterPtr = PtrValue(pendingDoorAfter);
-		const auto lastDoorAfterForm = lastDoorAfter ? lastDoorAfter->GetFormID() : 0;
-		const auto pendingDoorAfterForm = pendingDoorAfter ? pendingDoorAfter->GetFormID() : 0;
-		const auto pendingCountAfter = a_player ? a_player->pendingDoorTeleportationInfo.count : 0;
+namespace LootGlow::RecoverySelector
+{
+    struct EffectManager;
+    struct MagicShaderHitEffect;
+    using Selector = MagicShaderHitEffect* (*)(EffectManager*, RE::TESObjectREFR*);
+    inline Selector original = nullptr;
+    inline bool installed = false;
+    inline constexpr std::uintptr_t siteRVA = 0x06660759;
+    inline constexpr std::uintptr_t targetRVA = 0x06741530;
+    MagicShaderHitEffect* Observe(EffectManager* manager, RE::TESObjectREFR* target)
+    {
+        // Snapshot state is local copied data only and is destroyed on return.
+        LootGlowRecovery::Result snapshot{};
+        std::uint32_t targetForm = 0;
+        const auto targetScalar = reinterpret_cast<std::uintptr_t>(target);
+        const auto managerScalar = reinterpret_cast<std::uintptr_t>(manager);
+        const bool formReadable = targetScalar &&
+            ::CopyGameMemory(targetScalar + 0x10, &targetForm, sizeof(targetForm));
+        const bool recoveryEnabled = ::g_settings.insaneTierDualReinitMode ||
+            ::g_settings.uniqueItemDualReinitMode || ::g_settings.singleShaderFullReinitMode;
+        const auto* tracked = recoveryEnabled ? ::FindTrackedRef(targetScalar) : nullptr;
+        const bool insanePair = tracked && tracked->appliedTier == LootTier::Insane &&
+            ::g_settings.insaneTierDualReinitMode && ::g_settings.insaneTierSecondaryEnabled;
+        const bool uniquePair = tracked && tracked->appliedTier == LootTier::Unique &&
+            ::g_settings.uniqueItemDualReinitMode && ::g_settings.uniqueItemSecondaryEnabled;
+        const bool pairedFullMode = (uniquePair && ::g_settings.uniqueItemFullReinitMode) ||
+            (insanePair && ::g_settings.insaneTierFullReinitMode);
+        const bool valueSingle = tracked && ::g_settings.singleShaderFullReinitMode &&
+            tracked->appliedTier != LootTier::None && tracked->valueGlow.applied &&
+            !tracked->secondaryGlow.applied && tracked->valueGlow.activeStacks > 1;
+        const bool lockpickSingle = tracked && ::g_settings.singleShaderFullReinitMode &&
+            tracked->appliedTier == LootTier::None && tracked->appliedLockpickGlow &&
+            tracked->lockpickGlow.applied && tracked->lockpickGlow.activeStacks > 1;
+        const bool singleStackTarget = valueSingle || lockpickSingle;
+        const auto primaryID = uniquePair ? ::g_settings.uniqueItemShaderFormID :
+            insanePair ? ::g_settings.insaneTierShaderFormID :
+            lockpickSingle ? ::g_settings.lockpickShaderFormID :
+            valueSingle ? ::TierShaderFormID(tracked->appliedTier) : 0;
+        const auto secondaryID = uniquePair ? ::g_settings.uniqueItemSecondaryShaderFormID :
+            insanePair ? ::g_settings.insaneTierSecondaryShaderFormID : 0;
+        const bool trackedPair = tracked && tracked->refFormID == targetForm &&
+            (insanePair || uniquePair) && tracked->valueGlow.applied &&
+            tracked->secondaryGlow.applied && primaryID && secondaryID && primaryID != secondaryID;
+        const bool recoveryTarget = formReadable && (trackedPair || singleStackTarget) &&
+            recoveryEnabled && primaryID != 0;
+        if (recoveryTarget) {
+            DualReloadRecovery::pending = {};
+            try {
+                if (LootGlowRecovery::AddressRange(managerScalar, 0xA0))
+                    snapshot = LootGlowRecovery::Capture(managerScalar + 0x90, ::g_effectVtable,
+                        targetScalar, primaryID, secondaryID, ::CopyGameMemory, ::NowMs);
+                else
+                    snapshot.status = LootGlowRecovery::Status::InvalidPointer;
+            } catch (...) {
+                snapshot.status = LootGlowRecovery::Status::Changed;
+            }
+        }
 
-		if (g_playerDoorTransitionActive && !incomingNull && a_cell != nullptr && newParentCellPtr != 0 && current3DAfterPtr != 0) {
-			++g_counters.playerDoorTransitionArrivals;
-			if (g_settings.debugLogging) {
-				REX::INFO("[LootGlow] player door transition arrival detected: seq={}, player={:016X}, parentCell={:016X}, current3D={:016X}, pendingDoor={:016X}/{:08X}, lastDoor={:016X}/{:08X}, transporting={}, travelUseDoor={}, pendingCount={}",
-					g_playerDoorTransitionSeq,
-					playerPtr,
-					newParentCellPtr,
-					current3DAfterPtr,
-					pendingDoorAfterPtr,
-					pendingDoorAfterForm,
-					lastDoorAfterPtr,
-					lastDoorAfterForm,
-					transportingAfter ? "true" : "false",
-					travelUseDoorAfter ? "true" : "false",
-					pendingCountAfter);
-			}
-			RepairTrackedDualShadersAfterPlayerDoorArrival("player-door-arrival");
-			g_playerDoorTransitionActive = false;
-		}
+        // Always forward unchanged arguments exactly once. Never inspect the returned object.
+        return LootGlowRecovery::ForwardObserved(original, [] {}, [&](MagicShaderHitEffect* actual) {
+            const auto actualScalar = reinterpret_cast<std::uintptr_t>(actual);
+            if (recoveryTarget &&
+                snapshot.status == LootGlowRecovery::Status::Checked && snapshot.unknownVtables == 0 &&
+                actualScalar && snapshot.predicted == actualScalar) {
+                std::uint32_t selectedShader = 0;
+                for (const auto& candidate : snapshot.candidates)
+                    if (candidate.completeEffect == actualScalar && candidate.targetMatch && candidate.eligible)
+                        selectedShader = candidate.shaderForm;
+                const auto alternateShader = selectedShader == primaryID ? secondaryID :
+                    selectedShader == secondaryID ? primaryID : 0;
+                if (singleStackTarget && selectedShader == primaryID) {
+                    DualReloadRecovery::Pending pending{};
+                    pending.selected = actualScalar;
+                    pending.target = targetScalar;
+                    pending.manager = managerScalar;
+                    pending.selectedShader = selectedShader;
+                    pending.tier = lockpickSingle ? LootTier::None : tracked->appliedTier;
+                    pending.lockpick = lockpickSingle;
+                    const auto expected = lockpickSingle ? tracked->lockpickGlow.activeStacks :
+                        tracked->valueGlow.activeStacks;
+                    bool overflow = false;
+                    for (const auto& entry : snapshot.candidates) {
+                        if (!entry.targetMatch || !entry.eligible || entry.shaderForm != primaryID) continue;
+                        if (pending.effectCount == pending.effects.size()) { overflow = true; break; }
+                        pending.effects[pending.effectCount++] = {entry.completeEffect, entry.shaderForm};
+                    }
+                    pending.fullStacks = !overflow && pending.effectCount == expected && expected > 1;
+                    DualReloadRecovery::pending = pending;
+                    REX::INFO("[LootGlow stack-reinit] armed: tier={} ref={:08X} completeStack={} captured={} expected={}",
+                        pending.lockpick ? "Lockpick" : TierName(pending.tier), targetForm,
+                        pending.fullStacks, pending.effectCount, expected);
+                }
+                if (alternateShader) for (const auto& candidate : snapshot.candidates) {
+                    if (candidate.targetMatch && candidate.eligible &&
+                        candidate.shaderForm == alternateShader) {
+                        DualReloadRecovery::Pending pending{};
+                        pending.selected = actualScalar;
+                        pending.alternate = candidate.completeEffect;
+                        pending.target = targetScalar;
+                        pending.manager = managerScalar;
+                        pending.selectedShader = selectedShader;
+                        pending.alternateShader = alternateShader;
+                        pending.tier = uniquePair ? LootTier::Unique : LootTier::Insane;
+                        if (pairedFullMode) {
+                            std::size_t primaryCount = 0, secondaryCount = 0;
+                            bool overflow = false;
+                            for (const auto& entry : snapshot.candidates) {
+                                if (!entry.targetMatch || !entry.eligible ||
+                                    (entry.shaderForm != primaryID && entry.shaderForm != secondaryID)) continue;
+                                if (pending.effectCount == pending.effects.size()) { overflow = true; break; }
+                                pending.effects[pending.effectCount++] = {entry.completeEffect, entry.shaderForm};
+                                if (entry.shaderForm == primaryID) ++primaryCount;
+                                else ++secondaryCount;
+                            }
+                            pending.fullStacks = !overflow &&
+                                primaryCount == tracked->valueGlow.activeStacks &&
+                                secondaryCount == tracked->secondaryGlow.activeStacks &&
+                                primaryCount > 0 && secondaryCount > 0;
+                            pending.primaryCount = primaryCount;
+                            pending.secondaryCount = secondaryCount;
+                        }
+                        DualReloadRecovery::pending = pending;
+                        if (pairedFullMode)
+                            REX::INFO("[LootGlow full-reinit] armed: tier={} ref={:08X} completePair={} captured={} primary={} secondary={} expected={}/{}",
+                                TierName(pending.tier), targetForm, pending.fullStacks, pending.effectCount,
+                                pending.primaryCount, pending.secondaryCount,
+                                tracked->valueGlow.activeStacks, tracked->secondaryGlow.activeStacks);
+                        break;
+                    }
+                }
+            }
+        }, manager, target);
+    }
 
-		MaybeLogStats("player-door-transition");
-	}
+    void Install()
+    {
+        if (installed) return;
+        if (!::g_recoveryLayoutReady) {
+            REX::INFO("[LootGlow recovery/select] NOT installed: exact executable fingerprint/layout not verified");
+            return;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+        const auto site = base + siteRVA;
+        const auto target = base + targetRVA;
+        std::array<std::uint8_t, 5> saved{};
+        if (!::CopyGameMemory(site, saved.data(), saved.size()) ||
+            !LootGlowRecovery::ExpectedDirectCall(saved, site, target)) {
+            REX::INFO("[LootGlow recovery/select] NOT installed: direct-call bytes mismatch at RVA=06660759; expected target RVA=06741530; no code patched");
+            return;
+        }
 
-	static inline REL::THookVFT SetParentCellHook{
-		RE::PlayerCharacter::VTABLE[0],
-		0x6B,
-		SetParentCell
-	};
-};
-
+        SYSTEM_INFO info{};
+        ::GetSystemInfo(&info);
+        const auto granularity = static_cast<std::uintptr_t>(info.dwAllocationGranularity);
+        if (!granularity) return;
+        const auto start = ((base + 0x09E1E000 + granularity - 1) / granularity) * granularity;
+        void* relay = nullptr;
+        for (std::size_t i = 0; i < 4096 && !relay; ++i) {
+            const auto candidate = start + i * granularity;
+            std::int32_t ignored = 0;
+            if (!RelativeCallDisplacement(site, candidate, ignored)) break;
+            relay = ::VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
+        if (!relay) {
+            REX::INFO("[LootGlow recovery/select] NOT installed: nearby relay allocation failed; no code patched");
+            return;
+        }
+        std::int32_t displacement = 0;
+        if (!RelativeCallDisplacement(site, reinterpret_cast<std::uintptr_t>(relay), displacement)) {
+            ::VirtualFree(relay, 0, MEM_RELEASE);
+            return;
+        }
+        std::array<std::uint8_t, 14> jump{0xFF, 0x25, 0, 0, 0, 0};
+        const auto callback = reinterpret_cast<std::uintptr_t>(&Observe);
+        std::memcpy(jump.data() + 6, &callback, sizeof(callback));
+        std::memcpy(relay, jump.data(), jump.size());
+        DWORD relayProtection = 0;
+        if (!::VirtualProtect(relay, 0x1000, PAGE_EXECUTE_READ, &relayProtection) ||
+            !::FlushInstructionCache(::GetCurrentProcess(), relay, jump.size())) {
+            ::VirtualFree(relay, 0, MEM_RELEASE);
+            REX::INFO("[LootGlow recovery/select] NOT installed: relay protection/cache setup failed; no code patched");
+            return;
+        }
+        DWORD previous = 0;
+        if (!::VirtualProtect(reinterpret_cast<void*>(site), saved.size(), PAGE_EXECUTE_READWRITE, &previous)) {
+            ::VirtualFree(relay, 0, MEM_RELEASE);
+            REX::INFO("[LootGlow recovery/select] NOT installed: callsite protection change failed; no code patched");
+            return;
+        }
+        std::array<std::uint8_t, 5> current{};
+        const bool unchanged = ::CopyGameMemory(site, current.data(), current.size()) && current == saved;
+        if (unchanged) {
+            original = reinterpret_cast<Selector>(target);
+            std::memcpy(reinterpret_cast<void*>(site + 1), &displacement, sizeof(displacement));
+            installed = true;
+        }
+        DWORD unused = 0;
+        if (!::VirtualProtect(reinterpret_cast<void*>(site), saved.size(), previous, &unused))
+            REX::INFO("[LootGlow recovery/select] callsite protection restore failed at RVA=06660759");
+        if (!installed) {
+            ::VirtualFree(relay, 0, MEM_RELEASE);
+            REX::INFO("[LootGlow recovery/select] NOT installed: callsite changed before patch; no code patched");
+            return;
+        }
+        if (!::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(site), saved.size()))
+            REX::INFO("[LootGlow recovery/select] callsite instruction-cache flush failed at RVA=06660759");
+        REX::INFO("LootGlow recovery selector installed: callsiteRVA=06660759 originalRVA=06741530");
+    }
+}
 
 struct Hook_SetInfoForRef_TieredLoot
 {
-	static bool SetInfoForRef(RE::TESObjectREFR* a_ref)
-	{
-		auto result = SetInfoForRefHook(a_ref);
-		++g_counters.hoverUpdateHits;
+    static bool SetInfoForRef(RE::TESObjectREFR* a_ref, bool a_arg2, bool a_arg3)
+    {
+        const bool result = SetInfoForRefHook(a_ref, a_arg2, a_arg3);
+        LootGlow::TieredLoot::ScanAndApplyTier(a_ref, "hover-update");
+        return result;
+    }
 
-		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
-		auto* container = baseObject ? baseObject->As<RE::TESObjectCONT>() : nullptr;
-		if (!container) {
-			return result;
-		}
-
-		++g_counters.hoverUpdateContainers;
-		LootGlow::TieredLoot::ScanAndApplyTier(a_ref, "hover-update");
-		MaybeLogStats("hover-update");
-		return result;
-	}
-
-	static inline REL::THook SetInfoForRefHook{
-		"LootGlow_SetInfoForRef_TieredLoot",
-		REL::ID(406425),
-		0x63,
-		SetInfoForRef
-	};
+    static inline REL::THook SetInfoForRefHook{
+        "LootGlow_SetInfoForRef_TieredLoot",
+        REL::ID(406425),
+        0x63,
+        SetInfoForRef
+    };
 };
-
 
 struct Hook_LoadGraphics_TieredLoot
 {
 	static std::uintptr_t LoadGraphicsFunc(RE::TESObjectREFR* a_ref)
 	{
+		// Compare only within this live native call; do not retain a scene pointer.
+		const auto before = a_ref ? a_ref->Get3D() : nullptr;
 		auto result = LoadGraphicsFuncHook(a_ref);
 		++g_counters.loadGraphicsHits;
+		const auto after = a_ref ? a_ref->Get3D() : nullptr;
+        if (!result || !after) return result;
+		// Load3D can return existing graphics. That is not a new-load refresh.
+		if (before == after) return result;
 
 		auto* baseObject = a_ref ? a_ref->GetObjectReference() : nullptr;
 		if (!baseObject) {
@@ -3168,7 +3134,10 @@ struct Hook_LoadGraphics_TieredLoot
 			name = rawName;
 		}
 
-		if (TrackContainer(a_ref, container, name)) {
+		if (auto* entry = TrackContainer(a_ref, container, name)) {
+			if (g_settings.legacyGlowNormalizationMode)
+				entry->legacyNormalizationCheckNeeded = true;
+			REX::INFO("[LootGlow graphics] new graphics observed: ref={:08X}; baseline load refresh", entry->refFormID);
 			LootGlow::TieredLoot::ScanAndApplyTier(a_ref, "loadgraphics");
 		}
 
@@ -3182,7 +3151,6 @@ struct Hook_LoadGraphics_TieredLoot
 		LoadGraphicsFunc
 	};
 };
-
 
 OBSE_PLUGIN_PRELOAD(const OBSE::PreLoadInterface* a_obse)
 {
@@ -3201,8 +3169,15 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 	});
 
 	LoadSettings();
-
-	REX::INFO("LootGlow v0.4.2C initialized");
+	if (g_settings.insaneTierDualReinitMode || g_settings.uniqueItemDualReinitMode ||
+		g_settings.singleShaderFullReinitMode || g_settings.legacyGlowNormalizationMode) {
+		InitializeRecoveryLayout();
+		LootGlow::RecoveryInitialization::Install();
+		if (LootGlow::RecoveryInitialization::installed)
+			LootGlow::RecoverySelector::Install();
+		REX::INFO("LootGlow native recovery hooks: initializer={} selector={}",
+			LootGlow::RecoveryInitialization::installed, LootGlow::RecoverySelector::installed);
+	}
 	REX::INFO("Tier settings: aggregateMode={}, Unique(enabled={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Low(enabled={}, threshold={}, shader={:08X}, stacks={}), Medium(enabled={}, threshold={}, shader={:08X}, stacks={}), High(enabled={}, threshold={}, shader={:08X}, stacks={}), Insane(enabled={}, threshold={}, primaryShader={:08X}, primaryStacks={}, secondaryEnabled={}, secondaryShader={:08X}, secondaryStacks={}), Lockpick(enabled={}, form={:08X}, shader={:08X}, stacks={})",
 		g_settings.valueAggregateMode,
 		g_settings.uniqueItemMode,
@@ -3236,7 +3211,13 @@ OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 		g_settings.lockpickStackCount);
 	REX::INFO("Visual refresh settings: refreshMode={} (0=off, 1=load/graphics defensive refresh)",
 		g_settings.visualRefreshMode);
-	REX::INFO("v0.4.2 behavior: AE materialize-before-classify plus PlayerCharacter::SetParentCell door-transition detection; on post-door player arrival, performs one event-driven full dual-shader rebuild pass for tracked dual-shader refs with valid 3D. Potion/poison AlchemyItem and IngredientItem values count toward tier thresholds; value diagnostics are available through DebugItemValues.");
+	REX::INFO("Reload recovery: legacyNormalization={} singleShaderFullStacks={} insaneMode={} insaneFullStacks={} uniqueMode={} uniqueFullStacks={}",
+		g_settings.legacyGlowNormalizationMode,
+		g_settings.singleShaderFullReinitMode,
+		g_settings.insaneTierDualReinitMode, g_settings.insaneTierFullReinitMode,
+		g_settings.uniqueItemDualReinitMode,
+		g_settings.uniqueItemFullReinitMode);
+	REX::INFO("Unique items take priority over monetary tiers; lockpick glow remains standalone");
 	if (g_settings.debugLogging) {
 		MaybeLogStats("startup", true);
 	}
