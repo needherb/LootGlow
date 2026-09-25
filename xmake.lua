@@ -26,9 +26,16 @@ target("LootGlow")
     add_includedirs("src")
     set_pcxxheader("src/pch.h")
 
-    if is_mode("release") then
-        set_symbols("none")
-        set_optimize("smallest")
-        add_cxflags("/O1", "/Gy", "/Gw", { force = true })
-        add_ldflags("/OPT:REF", "/OPT:ICF", "/DEBUG:NONE", { force = true })
-    end
+        if is_mode("release") then
+            set_symbols("none")
+            set_optimize("smallest")
+            add_cxflags("/O1", "/Gy", "/Gw", { force = true })
+            add_ldflags("/OPT:REF", "/OPT:ICF", "/DEBUG:NONE", { force = true })
+        end
+
+target("recovery_effect_list_tests")
+    set_kind("binary")
+    set_default(false)
+    add_undefines("NDEBUG")
+    add_files("tests/recovery_effect_list_tests.cpp")
+    add_includedirs("src")
